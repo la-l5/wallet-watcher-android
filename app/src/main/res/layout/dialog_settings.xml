@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="16dp">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="一、本地“自己人档案”（仅存本机，防自己转自己误记）"
+            android:textStyle="bold" />
+
+        <EditText
+            android:id="@+id/etRealName"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="本人真实姓名（发给AI前自动替换成[本人姓名]）"
+            android:inputType="textPersonName" />
+
+        <EditText
+            android:id="@+id/etAliases"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="常用昵称（多个用逗号分隔）"
+            android:inputType="text" />
+
+        <EditText
+            android:id="@+id/etCardTails"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="本人银行卡后四位（如 6288,8841）"
+            android:inputType="text" />
+
+        <EditText
+            android:id="@+id/etBrokers"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="常用券商名（逗号分隔，识别银证转账）"
+            android:inputType="text" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="14dp"
+            android:text="二、AI 接口预留（不勾选则默认内置模拟 AI，零成本运行）"
+            android:textStyle="bold" />
+
+        <CheckBox
+            android:id="@+id/cbUseRealApi"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="启用真实大模型 API（OpenAI 兼容格式）" />
+
+        <EditText
+            android:id="@+id/etBaseUrl"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Base URL（如 https://api.deepseek.com/v1）"
+            android:inputType="textUri" />
+
+        <EditText
+            android:id="@+id/etModel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Model 名称（如 deepseek-chat / qwen-plus）"
+            android:inputType="text" />
+
+        <EditText
+            android:id="@+id/etApiKey"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="API Key（sk-...，仅存本机数据库）"
+            android:inputType="textPassword" />
+
+    </LinearLayout>
+</ScrollView>

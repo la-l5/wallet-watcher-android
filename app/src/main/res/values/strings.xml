@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">钱包监测(MVP)</string>
+    <string name="listener_service_label">钱包自动记账通知监听</string>
+</resources>

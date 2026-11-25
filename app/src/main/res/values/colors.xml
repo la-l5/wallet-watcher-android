@@ -1,0 +1,10 @@
+<resources>
+    <color name="primary">#2563EB</color>
+    <color name="bg_page">#F3F5F9</color>
+    <color name="text_main">#182033</color>
+    <color name="text_muted">#64708A</color>
+    <color name="expense_red">#DC2626</color>
+    <color name="income_green">#059669</color>
+    <color name="refund_blue">#2563EB</color>
+    <color name="surface">#FFFFFF</color>
+</resources>
