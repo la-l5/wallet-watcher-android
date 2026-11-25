@@ -42,6 +42,8 @@ class WalletNotificationListenerService : NotificationListenerService() {
         // Ignore our own guard notification and system UI noise
         if (pkg == packageName || pkg == "android" || pkg == "com.android.systemui") return
 
+        if (pkg !in KNOWN_APPS && pkg != android.provider.Telephony.Sms.getDefaultSmsPackage(this)) return
+
         val notification = sbn.notification ?: return
         val extras = notification.extras ?: return
 

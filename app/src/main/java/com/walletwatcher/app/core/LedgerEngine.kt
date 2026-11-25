@@ -448,6 +448,7 @@ class LedgerEngine(
         var cleaned = text.replace(Regex("""(?:尾号|卡号)\s*\d{4}"""), "")
         cleaned = cleaned.replace(Regex("""\d{4}[-/年]\d{1,2}[-/月]\d{1,2}日?"""), "")
         cleaned = cleaned.replace(Regex("""\d{1,2}:\d{2}(?::\d{2})?"""), "")
+        cleaned = cleaned.replace(Regex("""(?:可用余额|余额|额度)[：: ]*[¥￥]?\s*[\d,.]+元?"""), "")
         for (pat in AMOUNT_PATTERNS) {
             val m = pat.find(cleaned) ?: continue
             val parsed = m.groupValues[1].replace(",", "").toDoubleOrNull()
@@ -488,7 +489,7 @@ class LedgerEngine(
 
     companion object {
         private val DIGIT_REGEX = Regex("""\d""")
-        private val CARD_TAIL_REGEX = Regex("""(?:尾号|卡号|\*{2,4})\s*(\d{4})""")
+        private val CARD_TAIL_REGEX = Regex("""(?:尾号|卡号|\*{2,4})\s*(?:\d{8,15})?(\d{4})(?!\d)""")
 
         private val AMOUNT_PATTERNS = listOf(
             Regex("""[¥￥]\s*(\d+(?:,\d{3})*(?:\.\d{1,2})?)"""),

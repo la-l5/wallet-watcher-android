@@ -82,6 +82,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         app.engine.removeOnChangeListener(engineListener)
+        refreshJob?.cancel()
         super.onDestroy()
     }
 
@@ -153,6 +154,8 @@ class MainActivity : AppCompatActivity() {
         refreshUi()
     }
 
+    private var refreshJob: kotlinx.coroutines.Job? = null
+
     private fun refreshUi() {
         val granted = isNotificationListenerGranted()
         val connText = when {
@@ -165,17 +168,11 @@ class MainActivity : AppCompatActivity() {
         tvServiceStatus.text = "监听：$connText | 网络：$netText | AI：${app.engine.aiConfig.displayLabel}" +
             if (bufCount > 0) " | 缓冲中($bufCount)" else ""
 
-        val summary = app.engine.getSummary()
-        tvNetExpense.text = fmtMoney(summary.netExpense)
-        tvIncome.text = fmtMoney(summary.totalIncome)
-        tvBalance.text = fmtMoney(summary.netBalance)
-        val dbKb = String.format(Locale.CHINA, "%.1f", summary.dbSizeBytes / 1024.0)
-        tvSubStats.text = "总支出 ${fmtMoney(summary.grossExpense)} · 退款冲抵 ${fmtMoney(summary.totalRefund)} · 拦截内部 ${summary.ignoredCount} 笔 · 断网队列 ${summary.offlineQueueCount} · 本地库 ${dbKb}KB"
-
-        tabLedger.text = "主账本(${summary.recordedCount})"
-        tabIgnored.text = "已忽略(${summary.ignoredCount})"
-
-        val rows: List<ListRow> = when (currentTab) {
+        refreshJob?.cancel()
+        val tab = currentTab
+        refreshJob = app.appScope.launch {
+            val summary = app.engine.getSummary()
+        val rows: List<ListRow> = when (tab) {
             Tab.LEDGER -> app.engine.store.listTransactions()
                 .filter { it.status == TxStatus.RECORDED || it.status == TxStatus.NEEDS_REVIEW }
                 .map { ListRow.TxRow(it, isIgnoredTab = false) }
@@ -185,8 +182,20 @@ class MainActivity : AppCompatActivity() {
             Tab.LOGS -> app.engine.store.listLogs(120).map { ListRow.LogRow(it) }
         }
 
+            withContext(Dispatchers.Main) {
+        tvNetExpense.text = fmtMoney(summary.netExpense)
+        tvIncome.text = fmtMoney(summary.totalIncome)
+        tvBalance.text = fmtMoney(summary.netBalance)
+        val dbKb = String.format(Locale.CHINA, "%.1f", summary.dbSizeBytes / 1024.0)
+        tvSubStats.text = "总支出 ${fmtMoney(summary.grossExpense)} · 退款冲抵 ${fmtMoney(summary.totalRefund)} · 拦截内部 ${summary.ignoredCount} 笔 · 断网队列 ${summary.offlineQueueCount} · 本地库 ${dbKb}KB"
+
+        tabLedger.text = "主账本(${summary.recordedCount})"
+        tabIgnored.text = "已忽略(${summary.ignoredCount})"
+
         adapter.submitList(rows)
         tvEmpty.visibility = if (rows.isEmpty()) View.VISIBLE else View.GONE
+            }
+        }
     }
 
     private fun isNotificationListenerGranted(): Boolean {

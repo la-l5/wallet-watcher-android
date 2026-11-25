@@ -151,4 +151,26 @@ class LedgerEngineCoreTest {
         assertEquals(0, engine.getSummary().offlineQueueCount)
         assertEquals(4.00, engine.getSummary().netExpense, 0.001)
     }
+
+    @Test
+    fun sameAmountDifferentMerchantsAndRefundAcrossMonths() {
+        val engine = LedgerEngine(InMemoryLedgerStore())
+        val time = 1700000000000L
+        engine.ingestNotification(RawNotification("a", "微信", "付款", "向甲商店付款20元", time))
+        engine.ingestNotification(RawNotification("b", "支付宝", "付款", "向乙商店付款20元", time + 500))
+        engine.flushExpired(true)
+        assertEquals(40.0, engine.getSummary(time).netExpense, 0.001)
+        val later = time + 32L * 86400000
+        engine.ingestNotification(RawNotification("a", "微信", "退款", "甲商店退款20元", later))
+        engine.flushExpired(true)
+        assertEquals(-20.0, engine.getSummary(later).netExpense, 0.001)
+    }
+
+    @Test
+    fun masksFormattedNumbersAndName() {
+        val masked = PrivacySanitizer.sanitize("林晓明 138-1234-5678，卡 6225 8801 1234 6288", UserProfile(realName = "林晓明")).first
+        assertFalse(masked.contains("林晓明"))
+        assertFalse(masked.contains("1234"))
+        assertTrue(masked.contains("****6288"))
+    }
 }

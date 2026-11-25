@@ -68,7 +68,7 @@ object AiClient {
         profile: UserProfile,
         payload: MergedPayload
     ): AiParseResult {
-        if (config.isRealApiEnabled) {
+        if (config.isRealApiEnabled && !payload.isZeroAuth && payload.preInternalReason == null) {
             return try {
                 callOpenAiCompatible(config, payload)
             } catch (e: java.io.IOException) {
@@ -108,7 +108,10 @@ object AiClient {
             })
         }
 
-        val conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+        val url = URL(endpoint)
+        require(url.protocol == "https") { "API 地址需要 HTTPS" }
+        val conn = (url.openConnection() as HttpURLConnection).apply {
+            instanceFollowRedirects = false
             requestMethod = "POST"
             connectTimeout = config.timeoutMs
             readTimeout = config.timeoutMs
