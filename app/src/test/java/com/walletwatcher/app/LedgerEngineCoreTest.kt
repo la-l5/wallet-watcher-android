@@ -68,7 +68,7 @@ class LedgerEngineCoreTest {
     @Test
     fun tripleChannelDedupMergesIntoOneTransaction() {
         val engine = LedgerEngine(InMemoryLedgerStore())
-        val t0 = 1_700_000_000_000L
+        val t0 = System.currentTimeMillis()
         engine.ingestNotification(RawNotification("com.tencent.mm", "微信", "微信支付", "向蜜雪冰城付款12.00元，商品：柠檬水", t0))
         engine.ingestNotification(RawNotification("cmb.pb", "招商银行", "动账提醒", "尾号6288储蓄卡消费12.00元，财付通-蜜雪冰城", t0 + 800L))
         engine.ingestNotification(RawNotification("com.unionpay", "云闪付", "交易通知", "卡号6225880112346288消费12.00元", t0 + 1500L))
@@ -105,7 +105,7 @@ class LedgerEngineCoreTest {
     @Test
     fun securitiesAndSelfTransfersAreIgnoredIncludingMirrorNetting() {
         val engine = LedgerEngine(InMemoryLedgerStore())
-        val t0 = 1_700_000_000_000L
+        val t0 = System.currentTimeMillis()
         engine.ingestNotification(RawNotification("cmb.pb", "招商银行", "银证转账", "尾号6288银行转证券向华泰证券第三方存管转出10000.00元", t0))
         engine.ingestNotification(RawNotification("com.ccb.android", "建设银行", "动账短信", "尾号3092证券转银行入账8500.00元，东方财富", t0 + 1000L, "sms"))
         engine.ingestNotification(RawNotification("cmb.pb", "招商银行", "转账成功", "尾号6288储蓄卡向林晓明转账2000.00元", t0 + 2000L))
@@ -128,7 +128,7 @@ class LedgerEngineCoreTest {
     fun refundNetsOutExpenseAndOfflineQueueReplays() {
         var online = true
         val engine = LedgerEngine(InMemoryLedgerStore(), isNetworkAvailable = { online })
-        val t0 = 1_700_000_000_000L
+        val t0 = System.currentTimeMillis()
         engine.ingestNotification(RawNotification("com.eg.android.AlipayGphone", "支付宝", "付款成功", "向淘宝付款129.00元", t0))
         engine.flushExpired(forceAll = true)
         engine.ingestNotification(RawNotification("com.eg.android.AlipayGphone", "支付宝", "退款通知", "淘宝退款129.00元已原路退回", t0 + 20_000L))
@@ -138,12 +138,14 @@ class LedgerEngineCoreTest {
         assertEquals(0.0, engine.getSummary().totalIncome, 0.001)
 
         // Offline garage test
+        engine.updateAiConfig(AiConfig(mode = AiConfig.MODE_OPENAI_COMPATIBLE, apiKey = "fixture"))
         online = false
         engine.ingestNotification(RawNotification("com.tencent.mm", "微信", "微信支付", "深圳地铁乘车码免密扣款4.00元", t0 + 50_000L))
         engine.flushExpired(forceAll = true)
         assertEquals(1, engine.getSummary().offlineQueueCount)
 
         online = true
+        engine.updateAiConfig(AiConfig())
         val replayed = engine.replayOfflineQueue()
         assertEquals(1, replayed)
         assertEquals(0, engine.getSummary().offlineQueueCount)

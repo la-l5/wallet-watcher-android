@@ -74,14 +74,15 @@ class WalletNotificationListenerService : NotificationListenerService() {
             content = content.ifEmpty { textLines.joinToString("；") },
             timestampMs = sbn.postTime.takeIf { it > 0L } ?: System.currentTimeMillis(),
             sourceType = sourceType,
-            isGroupSummary = isGroupSummary && textLines.size > 1,
-            subMessages = if (isGroupSummary && textLines.size > 1) textLines else emptyList()
+            isGroupSummary = isGroupSummary && textLines.isNotEmpty(),
+            notificationId = sbn.key,
+            subMessages = if (isGroupSummary && textLines.isNotEmpty()) textLines else emptyList()
         )
 
         app.appScope.launch {
             runCatching {
                 app.engine.ingestNotification(raw)
-                updateGuardNotification()
+
             }
         }
     }
@@ -107,7 +108,7 @@ class WalletNotificationListenerService : NotificationListenerService() {
             } else {
                 startForeground(GUARD_NOTIF_ID, notif)
             }
-        }
+        }.onFailure { app.engine.store.addLog("SERVICE", "前台状态通知启动失败：" + it.javaClass.simpleName) }
     }
 
     private fun updateGuardNotification() {
@@ -131,7 +132,7 @@ class WalletNotificationListenerService : NotificationListenerService() {
     }
 
     private fun buildGuardNotification(): Notification {
-        val summary = app.engine.getSummary()
+
         val intent = Intent(this, MainActivity::class.java)
         val pi = PendingIntent.getActivity(
             this,
@@ -142,7 +143,7 @@ class WalletNotificationListenerService : NotificationListenerService() {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_wallet_guard)
             .setContentTitle("钱包监测守护中")
-            .setContentText("已记 ${summary.recordedCount} 笔 · 净支出 ¥${String.format("%.2f", summary.netExpense)} · 拦截内部 ${summary.ignoredCount} 笔")
+            .setContentText("正在监听本机支付通知")
             .setOngoing(true)
             .setSilent(true)
             .setContentIntent(pi)

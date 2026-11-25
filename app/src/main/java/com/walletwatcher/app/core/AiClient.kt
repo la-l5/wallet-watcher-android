@@ -71,6 +71,8 @@ object AiClient {
         if (config.isRealApiEnabled) {
             return try {
                 callOpenAiCompatible(config, payload)
+            } catch (e: java.io.IOException) {
+                throw e
             } catch (e: Exception) {
                 val fallback = parseMock(profile, payload)
                 fallback.copy(

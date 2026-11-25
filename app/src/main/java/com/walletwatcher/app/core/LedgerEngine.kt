@@ -42,7 +42,7 @@ class LedgerEngine(
     fun updateProfile(newProfile: UserProfile) {
         profile = newProfile
         store.saveProfile(newProfile)
-        store.addLog("CONFIG", "已更新本地自己人档案（姓名=${newProfile.realName.ifBlank { "未填" }}，尾号=${newProfile.ownCardTails.joinToString(",")}）")
+        store.addLog("CONFIG", "已更新本地自己人档案（仅保存在此设备）")
         notifyChanged()
     }
 
@@ -107,7 +107,7 @@ class LedgerEngine(
             val matched = findMatchingBuffer(clue, notif.timestampMs)
             if (matched != null) {
                 matched.clues.add(clue)
-                matched.expiresAtMs = max(matched.expiresAtMs, notif.timestampMs + min(1500L, dedupWindowMs / 2))
+                
                 store.addLog(
                     "DEDUP_MERGE",
                     "防重合并命中！将【${notif.appName}】合入已有同笔缓冲（共 ${matched.clues.size} 条，¥${clue.amount}）"
@@ -184,15 +184,18 @@ class LedgerEngine(
         return rescued
     }
 
-    fun getSummary(): LedgerSummary {
-        val all = store.listTransactions(limit = 500)
+    fun getSummary(nowMs: Long = System.currentTimeMillis()): LedgerSummary {
+        val all = store.listTransactions(limit = Int.MAX_VALUE)
         val recorded = all.filter { it.status == TxStatus.RECORDED || it.status == TxStatus.NEEDS_REVIEW }
         val ignored = all.filter { it.status == TxStatus.IGNORED }
 
-        val grossExpense = round2(recorded.filter { it.direction == TxDirection.EXPENSE }.sumOf { it.amount })
-        val totalRefund = round2(recorded.filter { it.direction == TxDirection.REFUND }.sumOf { it.amount })
-        val netExpense = round2(max(0.0, grossExpense - totalRefund))
-        val totalIncome = round2(recorded.filter { it.direction == TxDirection.INCOME }.sumOf { it.amount })
+        val zone = java.time.ZoneId.systemDefault()
+        val month = java.time.YearMonth.from(java.time.Instant.ofEpochMilli(nowMs).atZone(zone))
+        val monthly = recorded.filter { java.time.YearMonth.from(java.time.Instant.ofEpochMilli(it.createdAtMs).atZone(zone)) == month }
+        val grossExpense = round2(monthly.filter { it.direction == TxDirection.EXPENSE }.sumOf { it.amount })
+        val totalRefund = round2(monthly.filter { it.direction == TxDirection.REFUND }.sumOf { it.amount })
+        val netExpense = round2(grossExpense - totalRefund)
+        val totalIncome = round2(monthly.filter { it.direction == TxDirection.INCOME }.sumOf { it.amount })
         val netBalance = round2(totalIncome - netExpense)
 
         return LedgerSummary(
@@ -226,7 +229,7 @@ class LedgerEngine(
         }
         // Only queue offline if real API is enabled AND network is currently down
         // (Or in general whenever device is offline, queue safely for consistent offline resilience)
-        if (!isNetworkAvailable()) {
+        if (aiConfig.isRealApiEnabled && !isNetworkAvailable()) {
             store.enqueueOffline(OfflineQueueItem(group.groupId, System.currentTimeMillis(), payload))
             store.addLog(
                 "OFFLINE_QUEUE",
@@ -234,7 +237,10 @@ class LedgerEngine(
             )
             return null
         }
-        return finalizePayload(payload)
+        return try { finalizePayload(payload) } catch (e: java.io.IOException) {
+            store.enqueueOffline(OfflineQueueItem(group.groupId, System.currentTimeMillis(), payload))
+            null
+        }
     }
 
     @Synchronized
@@ -453,18 +459,23 @@ class LedgerEngine(
     private fun findMatchingBuffer(clue: ParsedClue, nowMs: Long): BufferedGroup? {
         val amount = clue.amount ?: return null
         for (group in buffers.values) {
-            if (nowMs > group.expiresAtMs + 500L) continue
+            if (abs(nowMs - group.createdAtMs) > dedupWindowMs) continue
             val gAmt = group.amount ?: continue
             if (abs(gAmt - amount) < 0.005) {
                 val sameDir = group.roughDirection == clue.roughDirection ||
                     group.roughDirection == "UNKNOWN" || clue.roughDirection == "UNKNOWN"
                 if (!sameDir) continue
 
+                val merchant = AiClient.extractMerchant(clue.raw.content)
+                if (group.clues.any { prior ->
+                    val other = AiClient.extractMerchant(prior.raw.content)
+                    merchant != "未知商户" && other != "未知商户" && !merchant.contains(other) && !other.contains(merchant)
+                }) continue
                 val existingApps = group.clues.map { it.raw.appPackage }.toSet()
                 val existingSources = group.clues.map { it.raw.appPackage to it.raw.sourceType }.toSet()
                 if (clue.raw.appPackage !in existingApps ||
                     (clue.raw.appPackage to clue.raw.sourceType) !in existingSources ||
-                    group.clues.any { it.raw.content == clue.raw.content }
+                    group.clues.any { it.raw.notificationId == clue.raw.notificationId && it.raw.content == clue.raw.content }
                 ) {
                     return group
                 }
