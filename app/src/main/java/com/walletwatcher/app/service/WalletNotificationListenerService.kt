@@ -35,6 +35,12 @@ class WalletNotificationListenerService : NotificationListenerService() {
         app.engine.store.addLog("SERVICE", "通知监听服务已断开（若在荣耀手机上频繁出现，请检查电池与启动管理白名单）")
     }
 
+    private val summaryLines = LinkedHashMap<String, List<String>>()
+
+    override fun onNotificationRemoved(sbn: StatusBarNotification?) {
+        sbn?.key?.let { summaryLines.remove(it) }
+    }
+
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
         if (sbn == null) return
         val pkg = sbn.packageName ?: return
@@ -62,6 +68,13 @@ class WalletNotificationListenerService : NotificationListenerService() {
         if (isGroupSummary && textLines.isEmpty() && content.isEmpty()) return
         if (title.isEmpty() && content.isEmpty() && textLines.isEmpty()) return
 
+        val newLines = if (isGroupSummary && textLines.isNotEmpty()) {
+            val previous = summaryLines.put(sbn.key, textLines).orEmpty().toMutableList()
+            if (summaryLines.size > 128) summaryLines.remove(summaryLines.keys.first())
+            textLines.filter { !previous.remove(it) }
+        } else textLines
+        if (isGroupSummary && (newLines.isEmpty() || textLines.isEmpty())) return
+
         val appName = resolveAppName(pkg)
         val sourceType = if (pkg.contains("mms") || pkg.contains("messaging") || pkg.contains("sms")) {
             "sms"
@@ -78,7 +91,7 @@ class WalletNotificationListenerService : NotificationListenerService() {
             sourceType = sourceType,
             isGroupSummary = isGroupSummary && textLines.isNotEmpty(),
             notificationId = sbn.key,
-            subMessages = if (isGroupSummary && textLines.isNotEmpty()) textLines else emptyList()
+            subMessages = if (isGroupSummary) newLines else emptyList()
         )
 
         app.appScope.launch {
@@ -111,13 +124,6 @@ class WalletNotificationListenerService : NotificationListenerService() {
                 startForeground(GUARD_NOTIF_ID, notif)
             }
         }.onFailure { app.engine.store.addLog("SERVICE", "前台状态通知启动失败：" + it.javaClass.simpleName) }
-    }
-
-    private fun updateGuardNotification() {
-        runCatching {
-            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
-            nm.notify(GUARD_NOTIF_ID, buildGuardNotification())
-        }
     }
 
     private fun ensureChannel() {

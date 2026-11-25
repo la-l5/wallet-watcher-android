@@ -396,7 +396,8 @@ class LedgerEngine(
         val text = "${notif.title} ${notif.content}"
         val amount = extractAmount(text)
         val cardTail = CARD_TAIL_REGEX.find(text)?.groupValues?.getOrNull(1)
-        val isZeroAuth = ZERO_AUTH_KEYWORDS.any { text.contains(it) }
+        val isZeroAuth = ZERO_AUTH_KEYWORDS.any { text.contains(it) } &&
+            listOf("实际扣款", "已扣款", "扣款成功", "已完成扣款").none { text.contains(it) }
 
         val roughDir = when {
             isZeroAuth -> "ZERO_AUTH"
@@ -467,6 +468,7 @@ class LedgerEngine(
                     group.roughDirection == "UNKNOWN" || clue.roughDirection == "UNKNOWN"
                 if (!sameDir) continue
 
+                if (group.clues.any { it.cardTail != null && clue.cardTail != null && it.cardTail != clue.cardTail }) continue
                 val merchant = AiClient.extractMerchant(clue.raw.content)
                 if (group.clues.any { prior ->
                     val other = AiClient.extractMerchant(prior.raw.content)

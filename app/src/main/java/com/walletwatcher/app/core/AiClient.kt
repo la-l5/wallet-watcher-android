@@ -172,8 +172,7 @@ object AiClient {
         val payMethod = payload.paymentMethod.ifBlank { "默认钱包" }
 
         // 1. 0-yuan pay-later authorization
-        val zeroKeywords = listOf("0元下单", "0.00元下单", "已开通先用后付", "已使用先用后付", "先享后付已授权", "确认收货后自动扣款")
-        if (payload.isZeroAuth || zeroKeywords.any { text.contains(it) }) {
+        if (payload.isZeroAuth) {
             val merchant = extractMerchant(text)
             return AiParseResult(
                 direction = TxDirection.IGNORED,

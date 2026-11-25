@@ -172,28 +172,28 @@ class MainActivity : AppCompatActivity() {
         val tab = currentTab
         refreshJob = app.appScope.launch {
             val summary = app.engine.getSummary()
-        val rows: List<ListRow> = when (tab) {
-            Tab.LEDGER -> app.engine.store.listTransactions()
-                .filter { it.status == TxStatus.RECORDED || it.status == TxStatus.NEEDS_REVIEW }
-                .map { ListRow.TxRow(it, isIgnoredTab = false) }
-            Tab.IGNORED -> app.engine.store.listTransactions()
-                .filter { it.status == TxStatus.IGNORED }
-                .map { ListRow.TxRow(it, isIgnoredTab = true) }
-            Tab.LOGS -> app.engine.store.listLogs(120).map { ListRow.LogRow(it) }
-        }
+            val rows: List<ListRow> = when (tab) {
+                Tab.LEDGER -> app.engine.store.listTransactions()
+                    .filter { it.status == TxStatus.RECORDED || it.status == TxStatus.NEEDS_REVIEW }
+                    .map { ListRow.TxRow(it, isIgnoredTab = false) }
+                Tab.IGNORED -> app.engine.store.listTransactions()
+                    .filter { it.status == TxStatus.IGNORED }
+                    .map { ListRow.TxRow(it, isIgnoredTab = true) }
+                Tab.LOGS -> app.engine.store.listLogs(120).map { ListRow.LogRow(it) }
+            }
 
             withContext(Dispatchers.Main) {
-        tvNetExpense.text = fmtMoney(summary.netExpense)
-        tvIncome.text = fmtMoney(summary.totalIncome)
-        tvBalance.text = fmtMoney(summary.netBalance)
-        val dbKb = String.format(Locale.CHINA, "%.1f", summary.dbSizeBytes / 1024.0)
-        tvSubStats.text = "总支出 ${fmtMoney(summary.grossExpense)} · 退款冲抵 ${fmtMoney(summary.totalRefund)} · 拦截内部 ${summary.ignoredCount} 笔 · 断网队列 ${summary.offlineQueueCount} · 本地库 ${dbKb}KB"
+                tvNetExpense.text = fmtMoney(summary.netExpense)
+                tvIncome.text = fmtMoney(summary.totalIncome)
+                tvBalance.text = fmtMoney(summary.netBalance)
+                val dbKb = String.format(Locale.CHINA, "%.1f", summary.dbSizeBytes / 1024.0)
+                tvSubStats.text = "总支出 ${fmtMoney(summary.grossExpense)} · 退款冲抵 ${fmtMoney(summary.totalRefund)} · 拦截内部 ${summary.ignoredCount} 笔 · 断网队列 ${summary.offlineQueueCount} · 本地库 ${dbKb}KB"
 
-        tabLedger.text = "主账本(${summary.recordedCount})"
-        tabIgnored.text = "已忽略(${summary.ignoredCount})"
+                tabLedger.text = "主账本(${summary.recordedCount})"
+                tabIgnored.text = "已忽略(${summary.ignoredCount})"
 
-        adapter.submitList(rows)
-        tvEmpty.visibility = if (rows.isEmpty()) View.VISIBLE else View.GONE
+                adapter.submitList(rows)
+                tvEmpty.visibility = if (rows.isEmpty()) View.VISIBLE else View.GONE
             }
         }
     }
