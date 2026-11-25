@@ -10,11 +10,15 @@
 - **先用后付闭环**：0 元占坑自动忽略，确认收货真实扣款再入账；信用消费当下记支出、月底还款自动忽略。
 - **退款冲抵**：商户退款不虚增收入，自动扣减本月真实净支出。
 - **离线容错 + 隐私脱敏**：发给云端前自动掩码银行卡号/手机号/身份证号/实名；断网自动暂存本地 SQLite，联网自动补发。
-- **AI 接口预留**：默认运行内置模拟 AI 零成本测试，设置页随时切换任意 OpenAI 兼容大模型 API（DeepSeek / Qwen / GLM 等）。
+- **默认接入 DeepSeek 真实 API（零明文泄露）**：源码不含任何明文 API Key；通过 GitHub Actions Repository Secret `DEEPSEEK_API_KEY` 在云端编译时安全注入 APK，装上手机即开箱即用，也可随时在设置页切换模型或覆盖 Key。
 - **荣耀真机保活适配**：Android 14/15 `specialUse` 前台低优先级常驻状态通知 + 一键跳转应用启动管理与电池白名单。
 
 ## 云端编译 APK（无需本机装 Android Studio）
 
-1. 将本目录推送到你的 GitHub **Private（私有）仓库** 的 `main` 分支。
-2. GitHub Actions 会自动运行 `.github/workflows/build-apk.yml`：先执行全部纯 JVM 单元测试，再生成 `app-debug.apk`。
-3. 在仓库的 **Actions** -> 最新运行记录 -> **Artifacts** 中下载 `wallet-watcher-debug-apk` 解压，将 `.apk` 传到荣耀手机安装即可。
+1. 在你的 GitHub 账号下创建一个 **Private（私有）仓库**。
+2. 进入仓库 **Settings -> Secrets and variables -> Actions -> New repository secret**：
+   - Name 填：`DEEPSEEK_API_KEY`
+   - Secret 填：你的 DeepSeek API Key
+3. 将本目录推送到仓库的 `main` 分支（或手动在 Actions 点 **Run workflow**）。
+4. GitHub Actions 会自动先跑纯本地单元测试（不消耗 API 余额），再注入 Secret 编译 `app-debug.apk`。
+5. 在仓库的 **Actions** -> 最新运行记录 -> **Artifacts** 中下载 `wallet-watcher-debug-apk` 解压，将 `.apk` 传到荣耀手机安装即可。

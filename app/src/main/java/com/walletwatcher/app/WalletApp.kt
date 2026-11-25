@@ -46,9 +46,19 @@ class WalletApp : Application() {
 
     private fun startBufferFlusher() {
         appScope.launch {
+            var ticks = 0
             while (isActive) {
                 runCatching {
                     engine.flushExpired(forceAll = false)
+                }
+                ticks++
+                if (ticks >= 30) {
+                    ticks = 0
+                    runCatching {
+                        if (checkNetworkAvailable() && engine.store.listOfflineQueue().isNotEmpty()) {
+                            engine.replayOfflineQueue()
+                        }
+                    }
                 }
                 delay(1000L)
             }

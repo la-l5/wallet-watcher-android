@@ -26,8 +26,8 @@ data class UserProfile(
 )
 
 data class AiConfig(
-    val mode: String = MODE_MOCK, // MODE_MOCK | MODE_OPENAI_COMPATIBLE
-    val baseUrl: String = "https://api.deepseek.com/v1",
+    val mode: String = MODE_OPENAI_COMPATIBLE, // MODE_OPENAI_COMPATIBLE (default) | MODE_MOCK
+    val baseUrl: String = "https://api.deepseek.com",
     val apiKey: String = "",
     val model: String = "deepseek-chat",
     val timeoutMs: Int = 15000
@@ -35,8 +35,15 @@ data class AiConfig(
     val isRealApiEnabled: Boolean
         get() = mode == MODE_OPENAI_COMPATIBLE && apiKey.isNotBlank() && baseUrl.isNotBlank()
 
+    val isMissingApiKey: Boolean
+        get() = mode == MODE_OPENAI_COMPATIBLE && apiKey.isBlank()
+
     val displayLabel: String
-        get() = if (isRealApiEnabled) "真实 API ($model)" else "内置模拟 AI（默认已就绪）"
+        get() = when {
+            isRealApiEnabled -> "DeepSeek API ($model) 已就绪"
+            isMissingApiKey -> "未配置 API Key（点击右上角设置）"
+            else -> "离线规则模式"
+        }
 
     companion object {
         const val MODE_MOCK = "mock"
@@ -53,7 +60,8 @@ data class RawNotification(
     val sourceType: String = "notification",
     val isGroupSummary: Boolean = false,
     val subMessages: List<String> = emptyList(),
-    val notificationId: String = UUID.randomUUID().toString().take(10)
+    val notificationId: String = UUID.randomUUID().toString(),
+    val fromSummary: Boolean = false
 )
 
 data class ParsedClue(
@@ -71,7 +79,7 @@ data class BufferedGroup(
     val createdAtMs: Long,
     var expiresAtMs: Long,
     val amount: Double?,
-    val roughDirection: String,
+    var roughDirection: String,
     val clues: MutableList<ParsedClue> = mutableListOf()
 )
 
@@ -138,3 +146,6 @@ data class LedgerSummary(
     val offlineQueueCount: Int,
     val dbSizeBytes: Long
 )
+
+internal fun effectiveKey(typed: String, endpoint: String, bakedEndpoint: String, baked: String): String =
+    typed.ifBlank { if (endpoint.trimEnd('/') == bakedEndpoint.trimEnd('/')) baked else "" }

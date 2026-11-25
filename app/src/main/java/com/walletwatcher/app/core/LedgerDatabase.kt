@@ -5,6 +5,7 @@ import android.content.Context
 import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
+import com.walletwatcher.app.BuildConfig
 import org.json.JSONArray
 import org.json.JSONObject
 import kotlin.math.abs
@@ -63,6 +64,7 @@ class LedgerDatabase(context: Context) :
             )
             """.trimIndent()
         )
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_tx_created ON transactions(created_at_ms DESC)")
         db.execSQL(
             """
             CREATE TABLE offline_queue (
@@ -94,7 +96,7 @@ class LedgerDatabase(context: Context) :
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        // MVP v1 schema
+        if (oldVersion < 2) db.execSQL("CREATE INDEX IF NOT EXISTS idx_tx_created ON transactions(created_at_ms DESC)")
     }
 
     override fun saveTransaction(tx: Transaction) = synchronized(lock) {
@@ -131,10 +133,15 @@ class LedgerDatabase(context: Context) :
 
     override fun listTransactions(limit: Int): List<Transaction> = synchronized(lock) {
         val list = mutableListOf<Transaction>()
-        readableDatabase.rawQuery(
-            "SELECT * FROM transactions ORDER BY created_at_ms DESC LIMIT ?",
-            arrayOf(limit.toString())
-        ).use { c ->
+        val cursor = if (limit <= 0 || limit == Int.MAX_VALUE) {
+            readableDatabase.rawQuery("SELECT * FROM transactions ORDER BY created_at_ms DESC", null)
+        } else {
+            readableDatabase.rawQuery(
+                "SELECT * FROM transactions ORDER BY created_at_ms DESC LIMIT ?",
+                arrayOf(limit.toString())
+            )
+        }
+        cursor.use { c ->
             while (c.moveToNext()) list.add(cursorToTx(c))
         }
         list
@@ -150,8 +157,8 @@ class LedgerDatabase(context: Context) :
             SELECT * FROM transactions
             WHERE status = 'RECORDED'
               AND direction = ?
-              AND ABS(amount - ?) < 0.005
-              AND created_at_ms >= ?
+              AND ABS(amount - CAST(? AS REAL)) < 0.005
+              AND created_at_ms >= CAST(? AS INTEGER)
             ORDER BY created_at_ms DESC
             LIMIT 1
             """.trimIndent(),
@@ -172,8 +179,8 @@ class LedgerDatabase(context: Context) :
             SELECT * FROM transactions
             WHERE status = 'RECORDED'
               AND direction = 'EXPENSE'
-              AND amount >= ? - 0.005
-              AND created_at_ms >= ?
+              AND amount >= CAST(? AS REAL) - 0.005
+              AND created_at_ms >= CAST(? AS INTEGER)
             ORDER BY created_at_ms DESC
             LIMIT 20
             """.trimIndent(),
@@ -302,13 +309,19 @@ class LedgerDatabase(context: Context) :
     }
 
     override fun loadAiConfig(): AiConfig = synchronized(lock) {
-        val raw = loadSettingJson("ai_config") ?: return AiConfig()
+        val defaultCfg = AiConfig(
+            mode = AiConfig.MODE_OPENAI_COMPATIBLE,
+            baseUrl = BuildConfig.DEFAULT_AI_BASE_URL,
+            apiKey = BuildConfig.DEFAULT_AI_API_KEY,
+            model = BuildConfig.DEFAULT_AI_MODEL
+        )
+        val raw = loadSettingJson("ai_config") ?: return defaultCfg
         val obj = JSONObject(raw)
         AiConfig(
-            mode = obj.optString("mode", AiConfig.MODE_MOCK),
-            baseUrl = obj.optString("baseUrl", "https://api.deepseek.com/v1"),
-            apiKey = obj.optString("apiKey", ""),
-            model = obj.optString("model", "deepseek-chat"),
+            mode = obj.optString("mode", defaultCfg.mode),
+            baseUrl = obj.optString("baseUrl", defaultCfg.baseUrl).ifBlank { defaultCfg.baseUrl },
+            apiKey = effectiveKey(obj.optString("apiKey", ""), obj.optString("baseUrl", defaultCfg.baseUrl).ifBlank { defaultCfg.baseUrl }, defaultCfg.baseUrl, defaultCfg.apiKey),
+            model = obj.optString("model", defaultCfg.model).ifBlank { defaultCfg.model },
             timeoutMs = obj.optInt("timeoutMs", 15000)
         )
     }
@@ -389,7 +402,7 @@ class LedgerDatabase(context: Context) :
 
     companion object {
         private const val DB_NAME = "wallet_watcher.db"
-        private const val DB_VERSION = 1
+        private const val DB_VERSION = 2
     }
 }
 

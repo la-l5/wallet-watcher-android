@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
+import android.provider.Telephony
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import androidx.core.app.NotificationCompat
@@ -22,6 +23,10 @@ class WalletNotificationListenerService : NotificationListenerService() {
     private val app: WalletApp
         get() = application as WalletApp
 
+    private val summaryLinesLock = Any()
+    private val summaryLines = LinkedHashMap<String, List<String>>()
+    private val appLabelCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+
     override fun onListenerConnected() {
         super.onListenerConnected()
         app.isListenerConnected = true
@@ -35,20 +40,21 @@ class WalletNotificationListenerService : NotificationListenerService() {
         app.engine.store.addLog("SERVICE", "通知监听服务已断开（若在荣耀手机上频繁出现，请检查电池与启动管理白名单）")
     }
 
-    private val summaryLines = LinkedHashMap<String, List<String>>()
-
     override fun onNotificationRemoved(sbn: StatusBarNotification?) {
-        sbn?.key?.let { summaryLines.remove(it) }
+        val key = sbn?.key ?: return
+        synchronized(summaryLinesLock) {
+            summaryLines.remove(key)
+        }
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
         if (sbn == null) return
         val pkg = sbn.packageName ?: return
 
-        // Ignore our own guard notification and system UI noise
+        // Ignore our own guard notification and core Android system UI
         if (pkg == packageName || pkg == "android" || pkg == "com.android.systemui") return
 
-        if (pkg !in KNOWN_APPS && pkg != android.provider.Telephony.Sms.getDefaultSmsPackage(this)) return
+        if (!isCandidateFinancePackage(pkg)) return
 
         val notification = sbn.notification ?: return
         val extras = notification.extras ?: return
@@ -69,18 +75,21 @@ class WalletNotificationListenerService : NotificationListenerService() {
         if (title.isEmpty() && content.isEmpty() && textLines.isEmpty()) return
 
         val newLines = if (isGroupSummary && textLines.isNotEmpty()) {
-            val previous = summaryLines.put(sbn.key, textLines).orEmpty().toMutableList()
-            if (summaryLines.size > 128) summaryLines.remove(summaryLines.keys.first())
-            textLines.filter { !previous.remove(it) }
-        } else textLines
+            synchronized(summaryLinesLock) {
+                val previous = summaryLines.put(sbn.key, textLines).orEmpty().toMutableList()
+                if (summaryLines.size > 128) {
+                    val oldestKey = summaryLines.keys.firstOrNull()
+                    if (oldestKey != null) summaryLines.remove(oldestKey)
+                }
+                textLines.filter { !previous.remove(it) }
+            }
+        } else {
+            textLines
+        }
         if (isGroupSummary && (newLines.isEmpty() || textLines.isEmpty())) return
 
         val appName = resolveAppName(pkg)
-        val sourceType = if (pkg.contains("mms") || pkg.contains("messaging") || pkg.contains("sms")) {
-            "sms"
-        } else {
-            "notification"
-        }
+        val sourceType = if (isSmsPackage(pkg)) "sms" else "notification"
 
         val raw = RawNotification(
             appPackage = pkg,
@@ -97,17 +106,37 @@ class WalletNotificationListenerService : NotificationListenerService() {
         app.appScope.launch {
             runCatching {
                 app.engine.ingestNotification(raw)
-
             }
         }
     }
 
+    private fun isSmsPackage(pkg: String): Boolean {
+        val defaultSms = runCatching { Telephony.Sms.getDefaultSmsPackage(this) }.getOrNull()
+        val lower = pkg.lowercase()
+        return pkg == defaultSms ||
+            lower.contains("mms") ||
+            lower.contains("messaging") ||
+            lower.contains(".sms")
+    }
+
+    private fun isCandidateFinancePackage(pkg: String): Boolean {
+        if (pkg in KNOWN_APPS || isSmsPackage(pkg)) return true
+        val lower = pkg.lowercase()
+        if (FINANCE_PKG_HINTS.any { lower.contains(it) }) return true
+        val label = resolveAppName(pkg)
+        return listOf("银行", "钱包", "支付", "证券", "理财", "信用", "短信").any { label.contains(it) }
+    }
+
     private fun resolveAppName(pkg: String): String {
         KNOWN_APPS[pkg]?.let { return it }
-        return runCatching {
+        appLabelCache[pkg]?.let { return it }
+        val resolved = runCatching {
             val ai = packageManager.getApplicationInfo(pkg, 0)
             packageManager.getApplicationLabel(ai).toString()
         }.getOrDefault(pkg)
+        if (appLabelCache.size > 200) appLabelCache.clear()
+        appLabelCache[pkg] = resolved
+        return resolved
     }
 
     private fun startGuardForegroundNotification() {
@@ -123,7 +152,9 @@ class WalletNotificationListenerService : NotificationListenerService() {
             } else {
                 startForeground(GUARD_NOTIF_ID, notif)
             }
-        }.onFailure { app.engine.store.addLog("SERVICE", "前台状态通知启动失败：" + it.javaClass.simpleName) }
+        }.onFailure {
+            app.engine.store.addLog("SERVICE", "前台状态通知启动失败：${it.javaClass.simpleName}")
+        }
     }
 
     private fun ensureChannel() {
@@ -140,7 +171,6 @@ class WalletNotificationListenerService : NotificationListenerService() {
     }
 
     private fun buildGuardNotification(): Notification {
-
         val intent = Intent(this, MainActivity::class.java)
         val pi = PendingIntent.getActivity(
             this,
@@ -151,7 +181,7 @@ class WalletNotificationListenerService : NotificationListenerService() {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_wallet_guard)
             .setContentTitle("钱包监测守护中")
-            .setContentText("正在监听本机支付通知")
+            .setContentText("正在监听本机支付与动账通知")
             .setOngoing(true)
             .setSilent(true)
             .setContentIntent(pi)
@@ -162,21 +192,45 @@ class WalletNotificationListenerService : NotificationListenerService() {
         private const val CHANNEL_ID = "wallet_watcher_guard"
         private const val GUARD_NOTIF_ID = 1001
 
+        private val FINANCE_PKG_HINTS = listOf(
+            "bank", "pay", "wallet", "cmb", "icbc", "ccb", "boc", "abc",
+            "psbc", "spdb", "cib", "ceb", "cgb", "cmbc", "pingan", "ecitic", "hxb", "dcep"
+        )
+
         private val KNOWN_APPS = mapOf(
             "com.tencent.mm" to "微信",
             "com.eg.android.AlipayGphone" to "支付宝",
             "com.unionpay" to "云闪付",
+            "cn.gov.pbc.dcep" to "数字人民币",
+            // 国有与股份制主流银行及信用卡 App
             "cmb.pb" to "招商银行",
+            "com.cmbchina.ccd.pluto.cmbActivity" to "掌上生活",
             "com.icbc" to "工商银行",
             "com.chinamworld.main" to "建设银行",
             "com.android.bankabc" to "农业银行",
             "com.chinamworld.bocmbci" to "中国银行",
             "com.bankcomm.Bankcomm" to "交通银行",
+            "com.yitong.mbank.psbc" to "邮储银行",
+            "com.pingan.paces.ccms" to "平安口袋银行",
+            "com.ecitic.bank.mobile" to "中信银行",
+            "cn.com.spdb.mobilebank.per" to "浦发银行",
+            "com.cebbank.mobile.cemb" to "光大银行",
+            "com.cib.cibmb" to "兴业银行",
+            "cn.com.cmbc.newmbank" to "民生银行",
+            "com.cgbchina.xpt" to "广发银行",
+            "com.hxb.mobile" to "华夏银行",
+            // 主流消费/出行平台
             "com.sankuai.meituan" to "美团",
+            "com.sankuai.meituan.takeoutnew" to "美团外卖",
             "com.taobao.taobao" to "淘宝",
             "com.xunmeng.pinduoduo" to "拼多多",
             "com.jingdong.app.mall" to "京东",
-            "com.ss.android.ugc.aweme" to "抖音"
+            "com.ss.android.ugc.aweme" to "抖音",
+            "com.sdu.didi.psnger" to "滴滴出行",
+            // 荣耀/华为/通用短信
+            "com.hihonor.mms" to "短信",
+            "com.huawei.mms" to "短信",
+            "com.android.mms" to "短信"
         )
     }
 }

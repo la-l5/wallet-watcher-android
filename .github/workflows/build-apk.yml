@@ -25,6 +25,7 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
+          cache-disabled: true
 
       - name: Accept Android SDK Licenses (if needed)
         run: |
@@ -32,8 +33,27 @@ jobs:
             yes | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
           fi
 
-      - name: Run Unit Tests & Build Debug APK
-        run: gradle testDebugUnitTest assembleDebug --stacktrace
+      - name: Run Offline Unit Tests
+        run: gradle testDebugUnitTest --stacktrace
+
+      - name: Build Debug APK (with Secret API Key Injection)
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_BASE_URL: ${{ vars.DEEPSEEK_BASE_URL || 'https://api.deepseek.com' }}
+          DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL || 'deepseek-chat' }}
+        run: |
+          if [ -z "${DEEPSEEK_API_KEY}" ]; then
+            echo "::warning::Repository Secret DEEPSEEK_API_KEY is not set. APK will build without a baked-in key (you can still fill it inside the app Settings)."
+          fi
+          gradle assembleDebug --no-build-cache --no-configuration-cache --rerun-tasks
+          python3 - <<'PY'
+          import os, zipfile
+          key = os.environ["DEEPSEEK_API_KEY"].encode()
+          if key:
+              with zipfile.ZipFile("app/build/outputs/apk/debug/app-debug.apk") as apk:
+                  if not any(key in apk.read(n) for n in apk.namelist() if n.endswith(".dex")):
+                      raise SystemExit("Configured key missing from packaged DEX")
+          PY
 
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4

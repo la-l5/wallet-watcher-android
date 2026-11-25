@@ -3,6 +3,7 @@ package com.walletwatcher.app.ui
 import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -10,6 +11,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.service.notification.NotificationListenerService
 import android.view.LayoutInflater
 import android.view.View
 import android.widget.Button
@@ -33,6 +35,7 @@ import com.walletwatcher.app.core.Transaction
 import com.walletwatcher.app.core.TxDirection
 import com.walletwatcher.app.core.TxStatus
 import com.walletwatcher.app.core.UserProfile
+import com.walletwatcher.app.service.WalletNotificationListenerService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -77,6 +80,13 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        if (isNotificationListenerGranted() && !app.isListenerConnected) {
+            runCatching {
+                NotificationListenerService.requestRebind(
+                    ComponentName(this, WalletNotificationListenerService::class.java)
+                )
+            }
+        }
         refreshUi()
     }
 
@@ -129,19 +139,24 @@ class MainActivity : AppCompatActivity() {
         tabLogs.setOnClickListener { switchTab(Tab.LOGS) }
 
         findViewById<Button>(R.id.btnCopySamples).setOnClickListener {
-            val text = app.engine.exportSanitizedDebugSamples()
-            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-            cm.setPrimaryClip(ClipData.newPlainText("wallet_samples", text))
-            Toast.makeText(this, "已复制脱敏通知样本，可直接粘贴发给 AI 调试规则", Toast.LENGTH_LONG).show()
+            app.appScope.launch {
+                val text = app.engine.exportSanitizedDebugSamples()
+                withContext(Dispatchers.Main) {
+                    val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    cm.setPrimaryClip(ClipData.newPlainText("wallet_samples", text))
+                    Toast.makeText(this@MainActivity, "已复制脱敏通知样本，可直接粘贴发给 AI 调试规则", Toast.LENGTH_LONG).show()
+                }
+            }
         }
 
         findViewById<Button>(R.id.btnClearAll).setOnClickListener {
             AlertDialog.Builder(this)
                 .setTitle("清空所有本地记录？")
-                .setMessage("仅清空账单和抓包日志，不会清空你的个人档案和 API 配置。")
+                .setMessage("仅清空账单、内存缓冲和抓包日志，不会清空你的个人档案和 API 配置。")
                 .setPositiveButton("清空") { _, _ ->
-                    app.engine.store.clearLedgerAndLogs()
-                    refreshUi()
+                    app.appScope.launch {
+                        app.engine.clearAllData()
+                    }
                 }
                 .setNegativeButton("取消", null)
                 .show()
@@ -249,29 +264,44 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun runBuiltInSelfTest() {
-        Toast.makeText(this, "已注入 3 组内置模拟通知（防重合并 + 银证拦截 + 先用后付0元），约 2 秒结算...", Toast.LENGTH_SHORT).show()
+        val btnSelfTest = findViewById<Button>(R.id.btnSelfTest)
+        if (!btnSelfTest.isEnabled) return
+        btnSelfTest.isEnabled = false
+
+        val hint = if (app.engine.aiConfig.isRealApiEnabled) {
+            "已注入 3 组测试单（并实测 DeepSeek API），请稍候 3~5 秒..."
+        } else {
+            "已注入 3 组内置模拟通知（防重合并 + 银证拦截 + 先用后付0元），约 2 秒结算..."
+        }
+        Toast.makeText(this, hint, Toast.LENGTH_SHORT).show()
         app.appScope.launch {
-            val now = System.currentTimeMillis()
-            // 1. WeChat + CMB concurrent notifications (should merge into 1 expense ¥12.00)
-            app.engine.ingestNotification(
-                RawNotification("com.tencent.mm", "微信", "微信支付", "微信支付凭证：向蜜雪冰城付款12.00元，商品：柠檬水", now)
-            )
-            app.engine.ingestNotification(
-                RawNotification("cmb.pb", "招商银行", "动账提醒", "您尾号6288储蓄卡消费人民币12.00元，商户：财付通-蜜雪冰城", now + 300L)
-            )
-            // 2. Bank -> Securities (should be ignored as internal transfer)
-            app.engine.ingestNotification(
-                RawNotification("cmb.pb", "招商银行", "银证转账", "您尾号6288账户银行转证券向华泰证券第三方存管转出10000.00元", now + 500L)
-            )
-            // 3. Pay-later 0-yuan order (should be ignored)
-            app.engine.ingestNotification(
-                RawNotification("com.tencent.mm", "微信", "微信支付分", "您已在拼多多0元下单，已使用先用后付，确认收货后自动扣款59.00元", now + 700L)
-            )
-            delay(1500L)
-            app.engine.flushExpired(forceAll = true)
-            withContext(Dispatchers.Main) {
-                refreshUi()
-                Toast.makeText(this@MainActivity, "自检完成！主账本应记 1 笔 ¥12.00，已忽略栏应拦 2 笔", Toast.LENGTH_LONG).show()
+            try {
+                val now = System.currentTimeMillis()
+                // 1. WeChat + CMB concurrent notifications (should merge into 1 expense ¥12.00)
+                app.engine.ingestNotification(
+                    RawNotification("com.tencent.mm", "微信", "微信支付", "微信支付凭证：向蜜雪冰城付款12.00元，商品：柠檬水", now)
+                )
+                app.engine.ingestNotification(
+                    RawNotification("cmb.pb", "招商银行", "动账提醒", "您尾号6288储蓄卡消费人民币12.00元，商户：财付通-蜜雪冰城", now + 300L)
+                )
+                // 2. Bank -> Securities (should be ignored as internal transfer)
+                app.engine.ingestNotification(
+                    RawNotification("cmb.pb", "招商银行", "银证转账", "您尾号6288账户银行转证券向华泰证券第三方存管转出10000.00元", now + 500L)
+                )
+                // 3. Pay-later 0-yuan order (should be ignored)
+                app.engine.ingestNotification(
+                    RawNotification("com.tencent.mm", "微信", "微信支付分", "您已在拼多多0元下单，已使用先用后付，确认收货后自动扣款59.00元", now + 700L)
+                )
+                delay(1500L)
+                app.engine.flushExpired(forceAll = true)
+                withContext(Dispatchers.Main) {
+                    refreshUi()
+                    Toast.makeText(this@MainActivity, "自检完成！主账本应记 1 笔 ¥12.00，已忽略栏应拦 2 笔", Toast.LENGTH_LONG).show()
+                }
+            } finally {
+                withContext(Dispatchers.Main) {
+                    btnSelfTest.isEnabled = true
+                }
             }
         }
     }
@@ -294,34 +324,49 @@ class MainActivity : AppCompatActivity() {
         etBrokers.setText(p.brokers.joinToString(","))
 
         val ai = app.engine.aiConfig
+        val hasBakedKey = com.walletwatcher.app.BuildConfig.DEFAULT_AI_API_KEY.isNotBlank()
         cbUseRealApi.isChecked = ai.mode == AiConfig.MODE_OPENAI_COMPATIBLE
         etBaseUrl.setText(ai.baseUrl)
         etModel.setText(ai.model)
-        etApiKey.setText(ai.apiKey)
+        // Never persist/echo the baked-in Secret key back into SQLite unless user explicitly overrides it
+        val isUsingBakedKeyOnly = hasBakedKey && ai.apiKey == com.walletwatcher.app.BuildConfig.DEFAULT_AI_API_KEY
+        if (isUsingBakedKeyOnly) {
+            etApiKey.setText("")
+            etApiKey.hint = "已自动启用内置编译 Key（留空继续使用，或输入新 Key 覆盖）"
+        } else {
+            etApiKey.setText(ai.apiKey)
+        }
 
         AlertDialog.Builder(this)
             .setTitle("个人档案 & AI 接口设置")
             .setView(view)
             .setPositiveButton("保存") { _, _ ->
                 fun splitCsv(s: String) = s.split(',', '，').map { it.trim() }.filter { it.isNotEmpty() }
-                app.engine.updateProfile(
-                    UserProfile(
-                        realName = etRealName.text.toString().trim(),
-                        aliases = splitCsv(etAliases.text.toString()),
-                        ownCardTails = splitCsv(etCardTails.text.toString()),
-                        brokers = splitCsv(etBrokers.text.toString()).ifEmpty { UserProfile().brokers }
-                    )
+                val newProfile = UserProfile(
+                    realName = etRealName.text.toString().trim(),
+                    aliases = splitCsv(etAliases.text.toString()),
+                    ownCardTails = splitCsv(etCardTails.text.toString()),
+                    brokers = splitCsv(etBrokers.text.toString()).ifEmpty { UserProfile().brokers }
                 )
-                app.engine.updateAiConfig(
-                    AiConfig(
-                        mode = if (cbUseRealApi.isChecked) AiConfig.MODE_OPENAI_COMPATIBLE else AiConfig.MODE_MOCK,
-                        baseUrl = etBaseUrl.text.toString().trim().ifEmpty { "https://api.deepseek.com/v1" },
-                        model = etModel.text.toString().trim().ifEmpty { "deepseek-chat" },
-                        apiKey = etApiKey.text.toString().trim()
-                    )
+                val typedKey = etApiKey.text.toString().trim()
+                val endpoint = etBaseUrl.text.toString().trim().ifEmpty { com.walletwatcher.app.BuildConfig.DEFAULT_AI_BASE_URL }
+                val effectiveKey = com.walletwatcher.app.core.effectiveKey(typedKey, endpoint, com.walletwatcher.app.BuildConfig.DEFAULT_AI_BASE_URL, com.walletwatcher.app.BuildConfig.DEFAULT_AI_API_KEY)
+                val newAi = AiConfig(
+                    mode = if (cbUseRealApi.isChecked) AiConfig.MODE_OPENAI_COMPATIBLE else AiConfig.MODE_MOCK,
+                    baseUrl = endpoint,
+                    model = etModel.text.toString().trim().ifEmpty { "deepseek-chat" },
+                    apiKey = effectiveKey
                 )
-                Toast.makeText(this, "设置已保存到本地", Toast.LENGTH_SHORT).show()
-                refreshUi()
+                val toPersistAi = newAi.copy(apiKey = typedKey)
+                app.appScope.launch {
+                    app.engine.updateProfile(newProfile)
+                    // Persist only user override in SQLite; keep effectiveKey active in memory
+                    app.engine.updateAiConfig(newConfig = newAi, persistConfig = toPersistAi)
+                    withContext(Dispatchers.Main) {
+                        val msg = if (newAi.isMissingApiKey) "已保存，但 API Key 仍为空，请填入后生效" else "设置已保存到本地"
+                        Toast.makeText(this@MainActivity, msg, Toast.LENGTH_SHORT).show()
+                    }
+                }
             }
             .setNegativeButton("取消", null)
             .show()
@@ -332,12 +377,10 @@ class MainActivity : AppCompatActivity() {
             .setTitle("把这笔记录捞回主账本？")
             .setMessage("${tx.merchant} ¥${String.format(Locale.CHINA, "%.2f", tx.amount)}\n请选择它实际应该属于支出还是收入：")
             .setPositiveButton("记为真实支出") { _, _ ->
-                app.engine.rescueIgnored(tx.id, TxDirection.EXPENSE)
-                refreshUi()
+                app.appScope.launch { app.engine.rescueIgnored(tx.id, TxDirection.EXPENSE) }
             }
             .setNeutralButton("记为真实收入") { _, _ ->
-                app.engine.rescueIgnored(tx.id, TxDirection.INCOME)
-                refreshUi()
+                app.appScope.launch { app.engine.rescueIgnored(tx.id, TxDirection.INCOME) }
             }
             .setNegativeButton("取消", null)
             .show()

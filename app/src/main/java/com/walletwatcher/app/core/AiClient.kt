@@ -7,6 +7,7 @@ import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
+import kotlin.math.abs
 import kotlin.math.roundToLong
 
 data class AiParseResult(
@@ -26,13 +27,15 @@ object AiClient {
     private const val SYSTEM_PROMPT = """你是一个严谨的个人财务记账 AI 会计，负责把手机通知栏抓取的脱敏文本解析为标准 JSON。
 核心规则：
 1. 只记录“外部 ↔ 内部钱包”的真实资金流动，所有内部流转一律判定为 INTERNAL_TRANSFER：
-   - 提现、充值、余额宝/零钱通转入转出、理财/基金申赎 -> INTERNAL_TRANSFER
+   - 本人零钱/余额提现、银行卡向本人微信零钱/支付宝余额充值、余额宝/零钱通转入转出、理财/基金申赎 -> INTERNAL_TRANSFER
+   - 注意：手机话费充值、水电燃气充值、交通卡/油卡/会员/游戏充值属于真实外部消费 -> EXPENSE（绝不是 INTERNAL_TRANSFER）
    - 信用卡/花呗/白条/美团月付/抖音月付还款 -> INTERNAL_TRANSFER
-   - 银证转账、银行转证券、证券转银行、第三方存管 -> INTERNAL_TRANSFER
+   - 银证转账、银行转证券、证券转银行、第三方存管 -> INTERNAL_TRANSFER（注意：券商软件付费会员/课程消费属于 EXPENSE）
    - 向[本人姓名]或[本人昵称]转账 -> INTERNAL_TRANSFER（注意：银行开头的“尊敬的[本人姓名]”只是称呼，不是转账对手）
 2. 先用后付：0元下单/已授权未扣款 -> IGNORED；确认收货真实扣款或花呗/信用卡单笔消费 -> EXPENSE。
 3. 商户退款 -> REFUND（冲抵支出，不是 INCOME）。
-4. 只输出严格 JSON：
+4. 验证码、扣款失败/交易失败/余额不足/已取消订单、优惠券/满减/促销广告、信用卡出账提醒/应还提醒（尚未实际扣款） -> IGNORED。
+5. amount 字段必须为正数（不要带负号），只输出严格 JSON：
 {"direction":"EXPENSE|INCOME|REFUND|INTERNAL_TRANSFER|IGNORED","amount":0.00,"merchant":"","item_summary":"","category":"","payment_method":"","needs_review":false,"reasoning":""}"""
 
     private val categoryRules: List<Pair<String, List<String>>> = listOf(
@@ -53,13 +56,14 @@ object AiClient {
     )
 
     private val merchantPatterns = listOf(
-        Regex("""(?:商户|收款方|交易对方|收款商户)[：:\s]*([^\s，。,;；()（）¥￥0-9]{2,20})"""),
+        Regex("""(?:商户|收款方|交易对方|对方|收款商户)[：:\s]*([^\s，。,;；()（）¥￥0-9]{2,20})"""),
         Regex("""(?:向|付款给)([^\s，。,;；()（）¥￥0-9]{2,16}?)(?:付款|转账|支付|消费|第三方存管|转出|转入|扣款|$)"""),
         Regex("""消费[，,\s]*([^\s，。,;；¥￥0-9]{2,16})"""),
         Regex("""来自([^\s，。,;；]{2,16})的"""),
         Regex("""([^\s，。,;；]{2,14}?)(?:自动扣款|免密扣款|先用后付|扣款)""")
     )
 
+    private val acquirerPrefixRegex = Regex("""^(?:财付通|微信支付|支付宝|网联|银联商务|银联|快捷支付|特约商户)[-—_:：\s]+""")
     private val trailingVerbRegex = Regex("""(?:付款|转账|支付|消费|转出|转入|扣款|第三方存管.*)$""")
     private val itemRegex = Regex("""(?:商品|备注|事由|说明|内容|购买)[：:\s]*([^，。\n；;]{2,28})""")
 
@@ -68,16 +72,27 @@ object AiClient {
         profile: UserProfile,
         payload: MergedPayload
     ): AiParseResult {
-        if (config.isRealApiEnabled && !payload.isZeroAuth && payload.preInternalReason == null) {
-            return try {
-                callOpenAiCompatible(config, payload)
-            } catch (e: java.io.IOException) {
-                throw e
-            } catch (e: Exception) {
+        if (!payload.isZeroAuth && payload.preInternalReason == null) {
+            if (config.isRealApiEnabled) {
+                return try {
+                    callOpenAiCompatible(config, payload)
+                } catch (e: java.io.IOException) {
+                    throw e
+                } catch (e: Exception) {
+                    val fallback = parseMock(profile, payload)
+                    fallback.copy(
+                        needsReview = true,
+                        aiModeUsed = "fallback_on_error",
+                        reasoning = "[DeepSeek API 异常已降级本地兜底: ${e.javaClass.simpleName}] ${fallback.reasoning}"
+                    )
+                }
+            }
+            if (config.isMissingApiKey) {
                 val fallback = parseMock(profile, payload)
-                fallback.copy(
-                    aiModeUsed = "mock_fallback",
-                    reasoning = "[真实API异常已自动降级: ${e.message ?: e.javaClass.simpleName}] ${fallback.reasoning}"
+                return fallback.copy(
+                    needsReview = true,
+                    aiModeUsed = "missing_api_key",
+                    reasoning = "[未配置 API Key，已暂用本地基础规则兜底；请在 GitHub Secret 或 App 设置填入] ${fallback.reasoning}"
                 )
             }
         }
@@ -91,7 +106,7 @@ object AiClient {
         }
 
         val userPrompt = buildString {
-            appendLine("请解析以下合并并脱敏后的手机动账通知：")
+            appendLine("请解析以下合并并脱敏后的手机动账通知，并严格按要求输出 JSON：")
             appendLine("---")
             appendLine(payload.sanitizedText)
             appendLine("---")
@@ -102,6 +117,8 @@ object AiClient {
         val bodyObj = JSONObject().apply {
             put("model", config.model)
             put("temperature", 0.1)
+            put("max_tokens", 512)
+            put("response_format", JSONObject().put("type", "json_object"))
             put("messages", JSONArray().apply {
                 put(JSONObject().put("role", "system").put("content", SYSTEM_PROMPT))
                 put(JSONObject().put("role", "user").put("content", userPrompt))
@@ -123,11 +140,8 @@ object AiClient {
         try {
             OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { it.write(bodyObj.toString()) }
             val code = conn.responseCode
-            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-            val rawResp = BufferedReader(InputStreamReader(stream, Charsets.UTF_8)).use { it.readText() }
-            if (code !in 200..299) {
-                throw IllegalStateException("HTTP $code")
-            }
+            checkHttpStatus(code)
+            val rawResp = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
             val respJson = JSONObject(rawResp)
             var content = respJson
                 .getJSONArray("choices")
@@ -142,13 +156,24 @@ object AiClient {
                     .trim()
             }
             val parsed = JSONObject(content)
-            val dir = runCatching {
-                TxDirection.valueOf(parsed.optString("direction", "EXPENSE").uppercase())
-            }.getOrDefault(TxDirection.EXPENSE)
+            val dir = parseDirection(parsed.getString("direction"))
+            val rawAmt = parsed.optDouble("amount", Double.NaN)
+            val fallbackAmt = payload.amount ?: 0.0
+            require(rawAmt.isNaN() || (rawAmt.isFinite() && abs(rawAmt) < 100_000_000))
+            val amount = round2(
+                when {
+                    rawAmt.isNaN() -> abs(fallbackAmt)
+                    abs(rawAmt) <= 0.0001 && dir != TxDirection.IGNORED && fallbackAmt > 0.0 -> abs(fallbackAmt)
+                    else -> abs(rawAmt)
+                }
+            )
 
-            val amount = round2(parsed.optDouble("amount", payload.amount ?: 0.0).let {
-                if (it.isNaN()) (payload.amount ?: 0.0) else it
-            })
+            val rawPayMethod = parsed.optString("payment_method", "").trim()
+            val safePayMethod = if (rawPayMethod.isBlank() || rawPayMethod in setOf("未知", "未知账户", "默认", "默认账户", "null")) {
+                payload.paymentMethod.ifBlank { "默认钱包" }
+            } else {
+                rawPayMethod
+            }
 
             return AiParseResult(
                 direction = dir,
@@ -156,7 +181,7 @@ object AiClient {
                 merchant = parsed.optString("merchant", "").ifBlank { extractMerchant(payload.sanitizedText) },
                 itemSummary = parsed.optString("item_summary", "").ifBlank { "交易记录" },
                 category = parsed.optString("category", "").ifBlank { "日用" },
-                paymentMethod = parsed.optString("payment_method", "").ifBlank { payload.paymentMethod.ifBlank { "默认钱包" } },
+                paymentMethod = safePayMethod,
                 needsReview = parsed.optBoolean("needs_review", false),
                 reasoning = parsed.optString("reasoning", "由真实大模型 API 解析"),
                 aiModeUsed = "real_api:${config.model}"
@@ -165,6 +190,10 @@ object AiClient {
             conn.disconnect()
         }
     }
+
+    internal fun checkHttpStatus(code: Int) = check(code in 200..299) { "HTTP $code" }
+
+    internal fun parseDirection(value: String) = TxDirection.valueOf(value.trim().uppercase())
 
     internal fun parseMock(profile: UserProfile, payload: MergedPayload): AiParseResult {
         val text = payload.sanitizedText
@@ -233,16 +262,17 @@ object AiClient {
         }
 
         // 4. Income vs Expense
-        val incomeCues = listOf("收款", "收入", "入账", "到账", "工资", "代发", "收到", "红包", "转入", "报销", "分红", "股息")
-        val expenseCues = listOf("支出", "付款", "消费", "扣款", "支付成功", "向", "已付", "免密扣款", "自动续费", "转出")
-        val strongExpenseCues = listOf("支付成功", "扣款", "付款给", "消费")
+        val incomeCues = listOf("收款", "收入", "入账", "到账", "工资", "代发", "收到", "红包", "转入", "报销", "分红", "股息", "向你付款", "向您付款", "已存入")
+        val expenseCues = listOf("支出", "付款", "消费", "扣款", "支取", "划扣", "代扣", "实付", "支付成功", "向", "已付", "免密扣款", "自动续费", "转出")
+        val textWithoutPayer = text.replace("付款方", "").replace("付款人", "").replace("向你付款", "").replace("向您付款", "")
+        val strongExpenseCues = listOf("支付成功", "扣款", "付款给", "消费", "支取", "实付")
 
         val direction: TxDirection
         val reasoning: String
-        if (payload.roughDirection == "IN" || (incomeCues.any { text.contains(it) } && strongExpenseCues.none { text.contains(it) })) {
+        if (payload.roughDirection == "IN" || (incomeCues.any { text.contains(it) } && strongExpenseCues.none { textWithoutPayer.contains(it) })) {
             direction = TxDirection.INCOME
             reasoning = "资金由外部流入本人账户，判定为真实收入。"
-        } else if (payload.roughDirection == "OUT" || expenseCues.any { text.contains(it) }) {
+        } else if (payload.roughDirection == "OUT" || expenseCues.any { textWithoutPayer.contains(it) }) {
             direction = TxDirection.EXPENSE
             reasoning = when {
                 listOf("花呗", "信用卡", "月付", "白条").any { text.contains(it) } ->
@@ -273,8 +303,10 @@ object AiClient {
     }
 
     private fun detectInternalReason(text: String, profile: UserProfile): String? {
+        val isMembershipOrPurchase = listOf("会员", "续费", "课程", "套餐", "商城", "软件").any { text.contains(it) }
+        val hasTransferContext = listOf("转账", "存管", "转出", "转入", "划转", "证券", "保证金", "银证").any { text.contains(it) }
         if (listOf("银证转账", "银行转证券", "证券转银行", "第三方存管", "资金存管").any { text.contains(it) }
-            || profile.brokers.any { text.contains(it) }
+            || (!isMembershipOrPurchase && hasTransferContext && profile.brokers.any { text.contains(it) })
         ) {
             return "银行与证券账户互转（银证转账），资产仍在本人名下。"
         }
@@ -300,10 +332,14 @@ object AiClient {
     }
 
     internal fun extractMerchant(text: String): String {
-        val ignoredTokens = setOf("微信支付", "支付宝", "人民币", "银行卡", "账户", "您", "你的", "财付通")
+        val ignoredTokens = setOf(
+            "微信支付", "支付宝", "人民币", "银行卡", "账户", "您", "你的",
+            "财付通", "网联", "银联", "银联商务", "财付通支付科技有限公司", "快捷支付"
+        )
         for (pat in merchantPatterns) {
             val m = pat.find(text) ?: continue
             var candidate = m.groupValues[1].trim('：', ':', '(', ')', '（', '）', '[', ']', '【', '】')
+            candidate = acquirerPrefixRegex.replace(candidate, "").trim()
             candidate = trailingVerbRegex.replace(candidate, "").trim()
             if (candidate.length >= 2 && candidate !in ignoredTokens) {
                 return candidate

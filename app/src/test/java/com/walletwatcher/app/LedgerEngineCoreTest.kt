@@ -13,7 +13,7 @@ class LedgerEngineCoreTest {
             aliases = listOf("小明"),
             ownCardTails = listOf("6288", "8841", "3092")
         ),
-        private var aiConfig: AiConfig = AiConfig()
+        private var aiConfig: AiConfig = AiConfig(mode = AiConfig.MODE_MOCK)
     ) : LedgerStore {
         private val txs = LinkedHashMap<String, Transaction>()
         private val queue = LinkedHashMap<String, OfflineQueueItem>()
@@ -145,7 +145,7 @@ class LedgerEngineCoreTest {
         assertEquals(1, engine.getSummary().offlineQueueCount)
 
         online = true
-        engine.updateAiConfig(AiConfig())
+        engine.updateAiConfig(AiConfig(mode = AiConfig.MODE_MOCK))
         val replayed = engine.replayOfflineQueue()
         assertEquals(1, replayed)
         assertEquals(0, engine.getSummary().offlineQueueCount)
@@ -172,5 +172,226 @@ class LedgerEngineCoreTest {
         assertFalse(masked.contains("林晓明"))
         assertFalse(masked.contains("1234"))
         assertTrue(masked.contains("****6288"))
+    }
+
+    @Test
+    fun missingApiKeyFlagsNeedsReviewExplicitly() {
+        val store = InMemoryLedgerStore(
+            aiConfig = AiConfig(mode = AiConfig.MODE_OPENAI_COMPATIBLE, apiKey = "")
+        )
+        val engine = LedgerEngine(store)
+        engine.ingestNotification(RawNotification("com.tencent.mm", "微信", "微信支付", "向瑞幸咖啡付款19.90元"))
+        engine.flushExpired(forceAll = true)
+
+        val tx = engine.store.listTransactions().first()
+        assertEquals("missing_api_key", tx.aiModeUsed)
+        assertEquals(TxStatus.NEEDS_REVIEW, tx.status)
+    }
+
+    @Test
+    fun clearAllDataDropsInMemoryBuffersToo() {
+        val engine = LedgerEngine(InMemoryLedgerStore())
+        engine.ingestNotification(RawNotification("com.tencent.mm", "微信", "微信支付", "向瑞幸咖啡付款18.00元"))
+        assertEquals(1, engine.activeBufferCount())
+        engine.clearAllData()
+        assertEquals(0, engine.activeBufferCount())
+        engine.flushExpired(forceAll = true)
+        assertEquals(0, engine.getSummary().recordedCount)
+    }
+
+    @Test
+    fun wechatChildAndGroupSummaryDoNotDoubleCount() {
+        val engine = LedgerEngine(InMemoryLedgerStore())
+        val t0 = 1_700_000_000_000L
+        engine.ingestNotification(
+            RawNotification(
+                appPackage = "com.tencent.mm",
+                appName = "微信",
+                title = "微信支付",
+                content = "微信支付凭证：向蜜雪冰城付款12.00元",
+                timestampMs = t0,
+                notificationId = "child-key-1"
+            )
+        )
+        engine.ingestNotification(
+            RawNotification(
+                appPackage = "com.tencent.mm",
+                appName = "微信",
+                title = "微信支付",
+                content = "[2条] 微信支付",
+                timestampMs = t0 + 80L,
+                isGroupSummary = true,
+                subMessages = listOf("微信支付凭证：向蜜雪冰城付款12.00元"),
+                notificationId = "summary-key-1"
+            )
+        )
+        engine.flushExpired(forceAll = true)
+        assertEquals(1, engine.getSummary(t0).recordedCount)
+        assertEquals(12.00, engine.getSummary(t0).netExpense, 0.001)
+    }
+
+    @Test
+    fun payLaterActualChargeWithConfirmWordingIsRecorded() {
+        val engine = LedgerEngine(InMemoryLedgerStore())
+        val t0 = 1_700_000_000_000L
+        engine.ingestNotification(
+            RawNotification("com.tencent.mm", "微信", "微信支付", "微信支付凭证：拼多多先用后付确认收货后自动扣款59.00元成功", t0)
+        )
+        engine.flushExpired(forceAll = true)
+        assertEquals(1, engine.getSummary(t0).recordedCount)
+        assertEquals(59.00, engine.getSummary(t0).netExpense, 0.001)
+    }
+
+    @Test
+    fun otpPromoAndBillRemindersAreFilteredOut() {
+        val engine = LedgerEngine(InMemoryLedgerStore())
+        val t0 = 1_700_000_000_000L
+        engine.ingestNotification(RawNotification("com.android.mms", "短信", "招商银行", "您的支付验证码为482910，5分钟内有效", t0))
+        engine.ingestNotification(RawNotification("com.sankuai.meituan", "美团", "美团外卖", "送您20元外卖神券已到账，点击领取去使用", t0 + 100L))
+        engine.ingestNotification(RawNotification("cmb.pb", "招商银行", "账单提醒", "您本月信用卡账单已出，本期应还3200.00元，最后还款日25日", t0 + 200L))
+        engine.flushExpired(forceAll = true)
+
+        assertEquals(0, engine.getSummary(t0).recordedCount)
+        assertEquals(0, engine.getSummary(t0).ignoredCount)
+    }
+
+    @Test
+    fun brokerMembershipFeeIsNotMistakenForSecuritiesTransfer() {
+        val engine = LedgerEngine(InMemoryLedgerStore())
+        val t0 = 1_700_000_000_000L
+        engine.ingestNotification(RawNotification("com.tencent.mm", "微信", "微信支付", "微信支付凭证：同花顺会员自动续费扣款28.00元", t0))
+        engine.flushExpired(forceAll = true)
+
+        assertEquals(1, engine.getSummary(t0).recordedCount)
+        assertEquals(28.00, engine.getSummary(t0).netExpense, 0.001)
+    }
+
+    @Test
+    fun bankRmbWithoutYuanAndCardNumberAreParsedAccurately() {
+        val engine = LedgerEngine(InMemoryLedgerStore())
+        val t0 = 1_700_000_000_000L
+        engine.ingestNotification(
+            RawNotification("cmb.pb", "招商银行", "动账提醒", "您卡号为6225880112346288于11月25日16:20消费RMB 35.50，可用余额RMB 1234.56", t0)
+        )
+        engine.ingestNotification(
+            RawNotification("com.chinamworld.bocmbci", "中国银行", "动账短信", "您尾号3092借记卡11月25日支取人民币50.00元，余额900.00元", t0 + 100L, "sms")
+        )
+        engine.flushExpired(forceAll = true)
+
+        assertEquals(2, engine.getSummary(t0).recordedCount)
+        assertEquals(85.50, engine.getSummary(t0).netExpense, 0.001)
+    }
+
+    @Test
+    fun refundToBankCardMergesIntoSingleRefundAndDoesNotInflateIncome() {
+        val engine = LedgerEngine(InMemoryLedgerStore())
+        val t0 = 1_700_000_000_000L
+        engine.ingestNotification(RawNotification("com.tencent.mm", "微信", "微信支付", "向美团外卖付款38.00元", t0))
+        engine.ingestNotification(RawNotification("cmb.pb", "招商银行", "动账提醒", "尾号6288消费38.00元，商户：财付通-美团", t0 + 500L))
+        engine.flushExpired(forceAll = true)
+        assertEquals(1, engine.getSummary(t0).recordedCount)
+        assertEquals(38.00, engine.getSummary(t0).netExpense, 0.001)
+
+        // Refund arrives via WeChat (REFUND) and CMB bank card credit (IN) within seconds
+        engine.ingestNotification(RawNotification("com.tencent.mm", "微信", "退款通知", "美团外卖退款38.00元已退回招商银行尾号6288", t0 + 30_000L))
+        engine.ingestNotification(RawNotification("cmb.pb", "招商银行", "动账提醒", "您尾号6288储蓄卡入账人民币38.00元，对方：财付通-美团", t0 + 31_000L))
+        engine.flushExpired(forceAll = true)
+
+        val summary = engine.getSummary(t0)
+        assertEquals(2, summary.recordedCount) // 1 expense + 1 merged refund
+        assertEquals(0.00, summary.netExpense, 0.001)
+        assertEquals(0.00, summary.totalIncome, 0.001)
+    }
+
+    @Test
+    fun outOfOrderMirrorTransferStillNetsOut() {
+        val engine = LedgerEngine(InMemoryLedgerStore())
+        val t0 = 1_700_000_000_000L
+        // Receiving bank notifies first (t0 + 2s), sending bank SMS arrives 2s later with timestamp t0
+        engine.ingestNotification(RawNotification("com.ccb.android", "建设银行", "动账通知", "尾号3092跨行转入到账5000.00元", t0 + 2000L))
+        engine.flushExpired(forceAll = true)
+        engine.ingestNotification(RawNotification("cmb.pb", "招商银行", "动账短信", "尾号6288网银转出5000.00元", t0, "sms"))
+        engine.flushExpired(forceAll = true)
+
+        val summary = engine.getSummary(t0)
+        assertEquals(0, summary.recordedCount)
+        assertEquals(2, summary.ignoredCount)
+    }
+
+    @Test
+    fun incomeMentioningPayerAndSignedAmountsAreParsedCorrectly() {
+        val engine = LedgerEngine(InMemoryLedgerStore())
+        val t0 = 1_700_000_000_000L
+        // 收款通知包含“付款方”或“向你付款”绝不能被误判为支出
+        engine.ingestNotification(RawNotification("com.tencent.mm", "微信", "微信支付", "微信支付凭证：收款200.00元，付款方：王凯", t0))
+        engine.ingestNotification(RawNotification("com.eg.android.AlipayGphone", "支付宝", "收款提醒", "王凯通过扫码向你付款+50.00元，已存入余额", t0 + 100L))
+        // 带负号的支出通知
+        engine.ingestNotification(RawNotification("cmb.pb", "招商银行", "动账提醒", "您尾号6288储蓄卡支出 -35.50元，商户：星巴克", t0 + 200L))
+        // 话费充值属于真实消费而非内部流转
+        engine.ingestNotification(RawNotification("com.eg.android.AlipayGphone", "支付宝", "付款成功", "向中国移动话费充值100.00元", t0 + 300L))
+        // 扣款失败 / 余额不足必须彻底忽略
+        engine.ingestNotification(RawNotification("cmb.pb", "招商银行", "交易提醒", "您尾号6288储蓄卡交易失败（余额不足），交易金额399.00元", t0 + 400L))
+        engine.ingestNotification(RawNotification("com.eg.android.AlipayGphone", "支付宝", "扣款通知", "自动扣款失败，未能扣除腾讯视频会员15.00元", t0 + 500L))
+        engine.flushExpired(forceAll = true)
+
+        val summary = engine.getSummary(t0)
+        assertEquals(4, summary.recordedCount)
+        assertEquals(250.00, summary.totalIncome, 0.001)
+        assertEquals(135.50, summary.netExpense, 0.001)
+        assertEquals(0, summary.ignoredCount)
+    }
+
+    @Test
+    fun separateSwipesAndUpdatedNotificationKeys() {
+        val engine = LedgerEngine(InMemoryLedgerStore())
+        val first = RawNotification("wallet", "钱包", "瑞幸咖啡", "付款成功 ¥19.90", notificationId = "one")
+        engine.ingestNotification(first)
+        engine.ingestNotification(first.copy(content = "付款成功 ¥19.90 使用银行卡"))
+        engine.ingestNotification(first.copy(notificationId = "two"))
+        engine.ingestNotification(first.copy(appPackage = "bank", title = "邻家便利店"))
+        val rows = engine.flushExpired(true)
+        assertEquals(3, rows.size)
+        assertTrue(rows.any { it.merchant == "瑞幸咖啡" })
+    }
+
+    @Test
+    fun interruptedBufferRecoversOnceAndUsesConvertedAmount() {
+        val store = InMemoryLedgerStore()
+        val first = LedgerEngine(store)
+        first.ingestNotification(RawNotification("bank", "银行", "消费", "消费10美元，折合人民币72.30元"))
+        assertEquals(0, first.replayOfflineQueue())
+        val restarted = LedgerEngine(store)
+        assertEquals(1, restarted.replayOfflineQueue())
+        assertEquals(0, restarted.replayOfflineQueue())
+        assertEquals(72.30, store.listTransactions().single().amount, 0.001)
+    }
+
+    @Test
+    fun privateExportContainsNoFreeText() {
+        val store = InMemoryLedgerStore()
+        val engine = LedgerEngine(store)
+        engine.ingestNotification(RawNotification("wallet", "钱包", "张某", "向张某付款5元，备注 private-fixture"))
+        engine.flushExpired(true)
+        store.addLog("CAPTURE", "", "旧样本：张某 private-fixture")
+        val exported = engine.exportSanitizedDebugSamples()
+        assertTrue(exported.contains("EXPENSE"))
+        assertFalse(exported.contains("张某"))
+        assertFalse(exported.contains("private-fixture"))
+    }
+
+    @Test
+    fun bakedCredentialStaysAtConfiguredEndpoint() {
+        val trusted = "https://api.deepseek.com"
+        assertEquals("fixture", effectiveKey("", trusted + "/", trusted, "fixture"))
+        assertEquals("", effectiveKey("", "https://example.org", trusted, "fixture"))
+        assertEquals("override", effectiveKey("override", "https://example.org", trusted, "fixture"))
+    }
+
+    @Test
+    fun rejectedHttpAndMalformedDirectionAreTerminal() {
+        for (code in listOf(401, 402, 403, 429)) {
+            assertThrows(IllegalStateException::class.java) { AiClient.checkHttpStatus(code) }
+        }
+        assertThrows(IllegalArgumentException::class.java) { AiClient.parseDirection("unexpected") }
     }
 }

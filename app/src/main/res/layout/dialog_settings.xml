@@ -47,34 +47,34 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="14dp"
-            android:text="二、AI 接口预留（不勾选则默认内置模拟 AI，零成本运行）"
+            android:text="二、大模型 API 配置（默认启用 DeepSeek，可随时更换 Key 或模型）"
             android:textStyle="bold" />
 
         <CheckBox
             android:id="@+id/cbUseRealApi"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="启用真实大模型 API（OpenAI 兼容格式）" />
+            android:text="启用真实大模型 API（默认开启 DeepSeek）" />
 
         <EditText
             android:id="@+id/etBaseUrl"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="Base URL（如 https://api.deepseek.com/v1）"
+            android:hint="Base URL（默认 https://api.deepseek.com）"
             android:inputType="textUri" />
 
         <EditText
             android:id="@+id/etModel"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="Model 名称（如 deepseek-chat / qwen-plus）"
+            android:hint="Model 名称（默认 deepseek-chat）"
             android:inputType="text" />
 
         <EditText
             android:id="@+id/etApiKey"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="API Key（sk-...，仅存本机数据库）"
+            android:hint="API Key（若通过 GitHub Secret 编译已自动注入，可在此覆盖）"
             android:inputType="textPassword" />
 
     </LinearLayout>
