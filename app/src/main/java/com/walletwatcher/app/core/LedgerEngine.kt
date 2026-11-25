@@ -12,12 +12,14 @@ class LedgerEngine(
     private val isNetworkAvailable: () -> Boolean = { true },
     var dedupWindowMs: Long = 10_000L,
     var mirrorWindowMs: Long = 180_000L,
-    private val nowProvider: () -> Long = { System.currentTimeMillis() }
+    private val nowProvider: () -> Long = { System.currentTimeMillis() },
+    private val parse: (AiConfig, UserProfile, MergedPayload) -> AiParseResult = AiClient::parse
 ) {
     private val bufferLock = Any()
     private val finalizeLock = Any()
     private val replayLock = Any()
     private val buffers = LinkedHashMap<String, BufferedGroup>()
+    private val delivered = LinkedHashMap<Pair<String, String>, Pair<Long, Pair<String, String>>>()
     private val changeListeners = CopyOnWriteArrayList<() -> Unit>()
 
     @Volatile
@@ -112,6 +114,9 @@ class LedgerEngine(
         }
 
         synchronized(bufferLock) {
+            val key = notif.appPackage to notif.notificationId
+            val event = notif.timestampMs to (notif.title to notif.content)
+            if (delivered[key] == event) return
             val matched = findMatchingBuffer(clue, notif.timestampMs)
             if (matched != null) {
                 matched.clues.add(clue)
@@ -138,6 +143,8 @@ class LedgerEngine(
             }
             val group = matched ?: buffers.values.last()
             store.enqueueOffline(OfflineQueueItem(group.groupId, nowProvider(), buildMergedPayload(group)))
+            delivered[key] = event
+            if (delivered.size > 256) delivered.remove(delivered.keys.first())
         }
         notifyChanged()
     }
@@ -169,6 +176,7 @@ class LedgerEngine(
     fun clearAllData() = synchronized(replayLock) {
         synchronized(bufferLock) {
             buffers.clear()
+            delivered.clear()
             store.clearLedgerAndLogs()
         }
         notifyChanged()
@@ -186,8 +194,17 @@ class LedgerEngine(
                     store.removeOfflineItem(item.queueId)
                     replayed++
                 } catch (e: java.io.IOException) {
-                    store.addLog("OFFLINE_REPLAY", "补发中断（网络波动：${e.javaClass.simpleName}），剩余记录继续留在队列")
-                    break
+                    if (item.failures < 2) {
+                        store.enqueueOffline(item.copy(failures = item.failures + 1))
+                        break
+                    }
+                    val local = AiClient.parseMock(profile, item.payload).copy(
+                        needsReview = true, aiModeUsed = "retry_limit", reasoning = "网络补发连续失败，已转本地待核对"
+                    )
+                    synchronized(finalizeLock) { commitParsedTransaction(item.payload, local) }
+                    store.removeOfflineItem(item.queueId)
+                    replayed++
+
                 }
             }
         } finally {
@@ -237,7 +254,7 @@ class LedgerEngine(
             netBalance = netBalance,
             recordedCount = recorded.size,
             ignoredCount = ignored.size,
-            offlineQueueCount = store.listOfflineQueue().size,
+            offlineQueueCount = synchronized(bufferLock) { store.listOfflineQueue().count { it.queueId !in buffers } },
             dbSizeBytes = store.getDbSizeBytes()
         )
     }
@@ -277,7 +294,7 @@ class LedgerEngine(
 
     private fun finalizePayload(payload: MergedPayload): Transaction {
         // Keep remote HTTP outside finalizeLock so slow API responses do not stall other threads
-        val ai = AiClient.parse(aiConfig, profile, payload)
+        val ai = parse(aiConfig, profile, payload)
         return synchronized(finalizeLock) {
             commitParsedTransaction(payload, ai)
         }

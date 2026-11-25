@@ -63,8 +63,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var recyclerView: RecyclerView
     private lateinit var adapter: TransactionAdapter
 
+    private val screenJob = kotlinx.coroutines.SupervisorJob()
+    private val screenScope = kotlinx.coroutines.CoroutineScope(screenJob + Dispatchers.IO)
+
     private val engineListener: () -> Unit = {
-        runOnUiThread { refreshUi() }
+        runOnUiThread { if (!isDestroyed && !isFinishing) refreshUi() }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -93,6 +96,7 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         app.engine.removeOnChangeListener(engineListener)
         refreshJob?.cancel()
+        screenJob.cancel()
         super.onDestroy()
     }
 
@@ -139,12 +143,12 @@ class MainActivity : AppCompatActivity() {
         tabLogs.setOnClickListener { switchTab(Tab.LOGS) }
 
         findViewById<Button>(R.id.btnCopySamples).setOnClickListener {
-            app.appScope.launch {
+            screenScope.launch {
                 val text = app.engine.exportSanitizedDebugSamples()
                 withContext(Dispatchers.Main) {
                     val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                     cm.setPrimaryClip(ClipData.newPlainText("wallet_samples", text))
-                    Toast.makeText(this@MainActivity, "已复制脱敏通知样本，可直接粘贴发给 AI 调试规则", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this@MainActivity, "已复制交易诊断摘要", Toast.LENGTH_LONG).show()
                 }
             }
         }
@@ -185,7 +189,7 @@ class MainActivity : AppCompatActivity() {
 
         refreshJob?.cancel()
         val tab = currentTab
-        refreshJob = app.appScope.launch {
+        refreshJob = screenScope.launch {
             val summary = app.engine.getSummary()
             val rows: List<ListRow> = when (tab) {
                 Tab.LEDGER -> app.engine.store.listTransactions()

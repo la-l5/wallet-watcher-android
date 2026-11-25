@@ -34,7 +34,15 @@ jobs:
           fi
 
       - name: Run Offline Unit Tests
-        run: gradle testDebugUnitTest --stacktrace
+        run: |
+          gradle testDebugUnitTest --stacktrace
+          python3 - <<'PY'
+          import glob, xml.etree.ElementTree as ET
+          suites = [ET.parse(f).getroot() for f in glob.glob("app/build/test-results/testDebugUnitTest/TEST-*.xml")]
+          passed = sum(int(s.get("tests")) - int(s.get("skipped", 0)) for s in suites)
+          assert passed > 0
+          print(f"Verified JVM tests passed: {passed}")
+          PY
 
       - name: Build Debug APK (with Secret API Key Injection)
         env:

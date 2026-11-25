@@ -124,7 +124,8 @@ data class Transaction(
 data class OfflineQueueItem(
     val queueId: String,
     val enqueuedAtMs: Long,
-    val payload: MergedPayload
+    val payload: MergedPayload,
+    val failures: Int = 0
 )
 
 data class AuditLogEntry(

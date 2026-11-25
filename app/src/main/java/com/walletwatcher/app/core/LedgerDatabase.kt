@@ -197,6 +197,7 @@ class LedgerDatabase(context: Context) :
     override fun enqueueOffline(item: OfflineQueueItem) = synchronized(lock) {
         val payload = item.payload
         val json = JSONObject().apply {
+            put("failures", item.failures)
             put("groupId", payload.groupId)
             put("createdAtMs", payload.createdAtMs)
             put("amount", payload.amount ?: JSONObject.NULL)
@@ -242,7 +243,7 @@ class LedgerDatabase(context: Context) :
                     deepLink = obj.optString("deepLink", ""),
                     deepLinkLabel = obj.optString("deepLinkLabel", "")
                 )
-                list.add(OfflineQueueItem(qid, enq, payload))
+                list.add(OfflineQueueItem(qid, enq, payload, obj.optInt("failures", 0)))
             }
         }
         list

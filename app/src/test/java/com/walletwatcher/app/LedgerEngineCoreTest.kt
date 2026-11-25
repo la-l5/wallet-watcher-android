@@ -394,4 +394,31 @@ class LedgerEngineCoreTest {
         }
         assertThrows(IllegalArgumentException::class.java) { AiClient.parseDirection("unexpected") }
     }
+
+    @Test
+    fun transportRetriesSurviveRestartAndStop() {
+        val store = InMemoryLedgerStore()
+        var calls = 0
+        fun engine() = LedgerEngine(store, parse = { _, _, _ ->
+            calls++
+            throw java.io.IOException("fixture")
+        })
+        val first = engine()
+        first.ingestNotification(RawNotification("bank", "银行", "付款", "付款成功12元"))
+        first.flushExpired(true)
+        repeat(6) { engine().replayOfflineQueue() }
+        assertEquals(4, calls)
+        assertTrue(store.listOfflineQueue().isEmpty())
+        assertEquals(TxStatus.NEEDS_REVIEW, store.listTransactions().single().status)
+    }
+
+    @Test
+    fun identicalCallbackAfterFlushIsIdempotent() {
+        val engine = LedgerEngine(InMemoryLedgerStore())
+        val event = RawNotification("bank", "银行", "消费", "消费12元")
+        engine.ingestNotification(event)
+        engine.flushExpired(true)
+        engine.ingestNotification(event)
+        assertTrue(engine.flushExpired(true).isEmpty())
+    }
 }
