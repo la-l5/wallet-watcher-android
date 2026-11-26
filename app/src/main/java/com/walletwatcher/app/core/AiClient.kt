@@ -2,17 +2,16 @@ package com.walletwatcher.app.core
 
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.BufferedReader
-import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
-import kotlin.math.abs
-import kotlin.math.roundToLong
 
 data class AiParseResult(
     val direction: TxDirection,
-    val amount: Double,
+    val amountMinor: Long,
+    val currency: String = "CNY",
+    val scale: Int = 2,
+    val selectedCandidateId: String? = null,
     val merchant: String,
     val itemSummary: String,
     val category: String,
@@ -20,31 +19,46 @@ data class AiParseResult(
     val needsReview: Boolean,
     val reasoning: String,
     val aiModeUsed: String
-)
+) {
+    val amount: Double
+        get() = MoneyMath.minorToDouble(amountMinor, scale)
+}
 
 object AiClient {
 
-    private const val SYSTEM_PROMPT = """你是一个严谨的个人财务记账 AI 会计，负责把手机通知栏抓取的脱敏文本解析为标准 JSON。
+    val ALLOWED_CATEGORIES: Set<String> = setOf(
+        "餐饮", "交通", "购物", "娱乐订阅", "居住缴费", "医疗健康", "日用", "人情转账", "手续费",
+        "工资收入", "投资收益", "副业/其他收入", "退款冲抵", "AA/报销冲抵", "内部流转", "忽略提醒"
+    )
+
+    val GENERIC_GATEWAY_MERCHANTS: Set<String> = setOf(
+        "微信支付", "支付宝", "人民币", "银行卡", "账户", "您", "你的",
+        "财付通", "网联", "银联", "银联商务", "财付通支付科技有限公司", "快捷支付", "收款码"
+    )
+
+    private const val SYSTEM_PROMPT = """你是一个严谨的个人财务记账助手，负责基于脱敏后的通知文本和本地提取的金额候选列表给出分类与建议，只输出严格 JSON。
 核心规则：
-1. 只记录“外部 ↔ 内部钱包”的真实资金流动，所有内部流转一律判定为 INTERNAL_TRANSFER：
+1. 你不能自造金额，只能从输入的 candidates 列表中选择一个真实存在的 candidateId 填入 selected_candidate_id；余额(BALANCE)、原价(LIST_PRICE)、优惠(DISCOUNT)、应还提醒(INSTALLMENT_DUE)绝不能作为实际入账金额。
+2. 只记录“外部 ↔ 内部钱包”的真实资金流动，所有内部流转判定为 INTERNAL_TRANSFER：
    - 本人零钱/余额提现、银行卡向本人微信零钱/支付宝余额充值、余额宝/零钱通转入转出、理财/基金申赎 -> INTERNAL_TRANSFER
-   - 注意：手机话费充值、水电燃气充值、交通卡/油卡/会员/游戏充值属于真实外部消费 -> EXPENSE（绝不是 INTERNAL_TRANSFER）
+   - 手机话费充值、水电燃气充值、交通卡/油卡/会员/游戏充值属于真实外部消费 -> EXPENSE
    - 信用卡/花呗/白条/美团月付/抖音月付还款 -> INTERNAL_TRANSFER
-   - 银证转账、银行转证券、证券转银行、第三方存管 -> INTERNAL_TRANSFER（注意：券商软件付费会员/课程消费属于 EXPENSE）
-   - 向[本人姓名]或[本人昵称]转账 -> INTERNAL_TRANSFER（注意：银行开头的“尊敬的[本人姓名]”只是称呼，不是转账对手）
-2. 先用后付：0元下单/已授权未扣款 -> IGNORED；确认收货真实扣款或花呗/信用卡单笔消费 -> EXPENSE。
-3. 商户退款 -> REFUND（冲抵支出，不是 INCOME）。
-4. 验证码、扣款失败/交易失败/余额不足/已取消订单、优惠券/满减/促销广告、信用卡出账提醒/应还提醒（尚未实际扣款） -> IGNORED。
-5. amount 字段必须为正数（不要带负号），只输出严格 JSON：
-{"direction":"EXPENSE|INCOME|REFUND|INTERNAL_TRANSFER|IGNORED","amount":0.00,"merchant":"","item_summary":"","category":"","payment_method":"","needs_review":false,"reasoning":""}"""
+   - 银证转账、银行转证券、证券转银行、第三方存管 -> INTERNAL_TRANSFER（券商软件会员/课程消费属于 EXPENSE）
+   - 向[本人姓名]或[本人昵称]转账 -> INTERNAL_TRANSFER（开头“尊敬的[本人姓名]”只是称呼）
+3. 先用后付：0元下单/已授权未扣款 -> IGNORED；确认收货真实扣款或花呗/信用卡单笔消费 -> EXPENSE。
+4. 商户退款 -> REFUND；朋友 AA 返还或公司报销 -> REIMBURSEMENT_OFFSET（不能伪装为商户退款）。
+5. category 必须从以下允许列表选择：餐饮、交通、购物、娱乐订阅、居住缴费、医疗健康、日用、人情转账、手续费、工资收入、投资收益、副业/其他收入、退款冲抵、AA/报销冲抵、内部流转、忽略提醒。
+只输出严格 JSON：
+{"direction":"EXPENSE|INCOME|REFUND|REIMBURSEMENT_OFFSET|INTERNAL_TRANSFER|IGNORED","selected_candidate_id":"c1","merchant":"","item_summary":"","category":"","payment_method":"","needs_review":false,"reasoning":""}"""
 
     private val categoryRules: List<Pair<String, List<String>>> = listOf(
         "餐饮" to listOf("瑞幸", "星巴克", "蜜雪冰城", "喜茶", "霸王茶姬", "美团外卖", "饿了么", "麦当劳", "肯德基", "海底捞", "餐厅", "餐饮", "咖啡", "奶茶", "烧烤", "拉面", "食堂", "便利店", "罗森", "全家", "7-11"),
         "交通" to listOf("地铁", "公交", "乘车码", "滴滴", "高德打车", "哈啰", "青桔", "美团单车", "12306", "中石油", "中石化", "加油", "高速", "ETC", "停车"),
-        "购物" to listOf("淘宝", "天猫", "拼多多", "京东", "抖音电商", "唯品会", "山姆", "盒马", "超市", "优衣库", "迪卡侬", "苹果", "Apple", "数码"),
+        "购物" to listOf("淘宝", "天猫", "拼多多", "京东", "抖音电商", "唯品会", "山姆", "盒马", "超市", "优衣库", "迪卡侬", "苹果", "Apple", "数码", "购机"),
         "娱乐订阅" to listOf("腾讯视频", "爱奇艺", "网易云", "QQ音乐", "B站", "哔哩哔哩", "WPS", "iCloud", "会员", "续费", "Steam", "游戏", "电影", "猫眼"),
         "居住缴费" to listOf("电网", "电费", "水费", "燃气", "宽带", "话费", "中国移动", "中国联通", "中国电信", "物业", "房租"),
         "医疗健康" to listOf("医院", "药房", "药店", "体检", "挂号", "诊所"),
+        "手续费" to listOf("手续费", "服务费", "佣金"),
         "日用" to listOf("理发", "顺丰", "菜鸟", "快递", "洗衣", "充电宝", "街电", "怪兽充电", "美团充电")
     )
 
@@ -75,7 +89,7 @@ object AiClient {
         if (!payload.isZeroAuth && payload.preInternalReason == null) {
             if (config.isRealApiEnabled) {
                 return try {
-                    callOpenAiCompatible(config, payload)
+                    callOpenAiCompatible(config, profile, payload)
                 } catch (e: java.io.IOException) {
                     throw e
                 } catch (e: Exception) {
@@ -83,7 +97,7 @@ object AiClient {
                     fallback.copy(
                         needsReview = true,
                         aiModeUsed = "fallback_on_error",
-                        reasoning = "[DeepSeek API 异常已降级本地兜底: ${e.javaClass.simpleName}] ${fallback.reasoning}"
+                        reasoning = "[AI 接口异常已降级本地兜底: ${e.javaClass.simpleName}] ${fallback.reasoning}"
                     )
                 }
             }
@@ -92,26 +106,38 @@ object AiClient {
                 return fallback.copy(
                     needsReview = true,
                     aiModeUsed = "missing_api_key",
-                    reasoning = "[未配置 API Key，已暂用本地基础规则兜底；请在 GitHub Secret 或 App 设置填入] ${fallback.reasoning}"
+                    reasoning = "[已启用 AI 模式但未配置 API Key，暂用本地基础规则兜底] ${fallback.reasoning}"
                 )
             }
         }
         return parseMock(profile, payload)
     }
 
-    private fun callOpenAiCompatible(config: AiConfig, payload: MergedPayload): AiParseResult {
+    private fun callOpenAiCompatible(
+        config: AiConfig,
+        profile: UserProfile,
+        payload: MergedPayload
+    ): AiParseResult {
         var endpoint = config.baseUrl.trim().trimEnd('/')
         if (!endpoint.endsWith("/chat/completions")) {
             endpoint = "$endpoint/chat/completions"
         }
 
+        val candidatesDesc = if (payload.candidates.isEmpty()) {
+            "无候选"
+        } else {
+            payload.candidates.joinToString("; ") { c ->
+                "${c.candidateId}=${MoneyMath.formatUnsignedMinor(c.amountMinor, c.currency, c.scale)} (${c.currency}, role=${c.role.name}, est=${c.isEstimated})"
+            }
+        }
+
         val userPrompt = buildString {
-            appendLine("请解析以下合并并脱敏后的手机动账通知，并严格按要求输出 JSON：")
+            appendLine("请结合脱敏通知与本地提取的金额候选，严格按 JSON 协议返回建议：")
             appendLine("---")
             appendLine(payload.sanitizedText)
             appendLine("---")
-            append("辅助参考：预提取金额=${payload.amount}，预提取支付方式=${payload.paymentMethod.ifBlank { "未知" }}，")
-            append("预检提示=${payload.preInternalReason ?: if (payload.isZeroAuth) "0元先用后付授权" else "无"}。")
+            appendLine("candidates: [$candidatesDesc]")
+            append("本地建议主候选=${payload.primaryCandidateId ?: "无"}，预提取支付方式=${payload.paymentMethod.ifBlank { "未知" }}")
         }
 
         val bodyObj = JSONObject().apply {
@@ -156,39 +182,78 @@ object AiClient {
                     .trim()
             }
             val parsed = JSONObject(content)
-            val dir = parseDirection(parsed.getString("direction"))
-            val rawAmt = parsed.optDouble("amount", Double.NaN)
-            val fallbackAmt = payload.amount ?: 0.0
-            require(rawAmt.isNaN() || (rawAmt.isFinite() && abs(rawAmt) < 100_000_000))
-            val amount = round2(
-                when {
-                    rawAmt.isNaN() -> abs(fallbackAmt)
-                    abs(rawAmt) <= 0.0001 && dir != TxDirection.IGNORED && fallbackAmt > 0.0 -> abs(fallbackAmt)
-                    else -> abs(rawAmt)
-                }
-            )
-
-            val rawPayMethod = parsed.optString("payment_method", "").trim()
-            val safePayMethod = if (rawPayMethod.isBlank() || rawPayMethod in setOf("未知", "未知账户", "默认", "默认账户", "null")) {
-                payload.paymentMethod.ifBlank { "默认钱包" }
-            } else {
-                rawPayMethod
-            }
-
-            return AiParseResult(
-                direction = dir,
-                amount = amount,
-                merchant = parsed.optString("merchant", "").ifBlank { extractMerchant(payload.sanitizedText) },
-                itemSummary = parsed.optString("item_summary", "").ifBlank { "交易记录" },
-                category = parsed.optString("category", "").ifBlank { "日用" },
-                paymentMethod = safePayMethod,
-                needsReview = parsed.optBoolean("needs_review", false),
-                reasoning = parsed.optString("reasoning", "由真实大模型 API 解析"),
-                aiModeUsed = "real_api:${config.model}"
-            )
+            return validateAndApplyAiResponse(parsed, profile, payload, "real_api:${config.model}")
         } finally {
             conn.disconnect()
         }
+    }
+
+    /**
+     * Enforces strict local control over bookable amount candidate, currency, category whitelist,
+     * and non-bookable role rejection (BALANCE / LIST_PRICE / DISCOUNT / INSTALLMENT_DUE).
+     */
+    internal fun validateAndApplyAiResponse(
+        parsed: JSONObject,
+        profile: UserProfile,
+        payload: MergedPayload,
+        aiModeUsed: String
+    ): AiParseResult {
+        val local = parseMock(profile, payload)
+        val dir = parseDirection(parsed.getString("direction"))
+
+        val suggestedCandId = parsed.optString("selected_candidate_id", "").trim().ifBlank { null }
+        val candidateMap = payload.candidates.associateBy { it.candidateId }
+        val localPrimary = payload.primaryCandidateId?.let { candidateMap[it] }
+        val suggestedCand = suggestedCandId?.let { candidateMap[it] }
+
+        var chosenCandidate: AmountCandidate? = localPrimary
+        var rejectedReason: String? = null
+        if (suggestedCandId != null) {
+            if (suggestedCand == null) {
+                rejectedReason = "AI 建议了不存在的候选编号($suggestedCandId)，已按本地规则拦截"
+            } else if (!AmountCandidateExtractor.isRoleBookableAsPrimary(suggestedCand.role) || suggestedCand.role == AmountRole.FEE) {
+                rejectedReason = "AI 误选了不可入账角色(${suggestedCand.role.name})，已强制采用本地核验金额"
+            } else if (localPrimary != null && localPrimary.role == AmountRole.PAID && suggestedCand.role != AmountRole.PAID && suggestedCand.role != AmountRole.SETTLEMENT) {
+                rejectedReason = "AI 未采用实付候选，已强制保留本地实付金额"
+            } else {
+                chosenCandidate = suggestedCand
+            }
+        }
+
+        val finalMinor = chosenCandidate?.amountMinor ?: local.amountMinor
+        val finalCurrency = chosenCandidate?.currency ?: local.currency
+        val finalScale = chosenCandidate?.scale ?: local.scale
+
+        val rawCategory = parsed.optString("category", "").trim()
+        val safeCategory = if (rawCategory in ALLOWED_CATEGORIES) rawCategory else local.category
+
+        val rawPayMethod = parsed.optString("payment_method", "").trim()
+        val safePayMethod = if (rawPayMethod.isBlank() || rawPayMethod in setOf("未知", "未知账户", "默认", "默认账户", "null")) {
+            payload.paymentMethod.ifBlank { "默认钱包" }
+        } else {
+            rawPayMethod
+        }
+
+        val baseReasoning = parsed.optString("reasoning", "由大模型辅助分类")
+        val finalReasoning = if (rejectedReason != null) "[$rejectedReason] $baseReasoning" else baseReasoning
+        val needsReview = parsed.optBoolean("needs_review", false) ||
+            payload.ambiguityReason != null ||
+            (chosenCandidate == null && dir != TxDirection.IGNORED)
+
+        return AiParseResult(
+            direction = dir,
+            amountMinor = finalMinor,
+            currency = finalCurrency,
+            scale = finalScale,
+            selectedCandidateId = chosenCandidate?.candidateId ?: local.selectedCandidateId,
+            merchant = parsed.optString("merchant", "").ifBlank { local.merchant },
+            itemSummary = parsed.optString("item_summary", "").ifBlank { local.itemSummary },
+            category = safeCategory,
+            paymentMethod = safePayMethod,
+            needsReview = needsReview,
+            reasoning = finalReasoning,
+            aiModeUsed = aiModeUsed
+        )
     }
 
     internal fun checkHttpStatus(code: Int) = check(code in 200..299) { "HTTP $code" }
@@ -197,7 +262,9 @@ object AiClient {
 
     internal fun parseMock(profile: UserProfile, payload: MergedPayload): AiParseResult {
         val text = payload.sanitizedText
-        val amount = round2(payload.amount ?: 0.0)
+        val amountMinor = payload.amountMinor ?: 0L
+        val currency = payload.currency
+        val scale = payload.scale
         val payMethod = payload.paymentMethod.ifBlank { "默认钱包" }
 
         // 1. 0-yuan pay-later authorization
@@ -205,14 +272,17 @@ object AiClient {
             val merchant = extractMerchant(text)
             return AiParseResult(
                 direction = TxDirection.IGNORED,
-                amount = amount,
+                amountMinor = amountMinor,
+                currency = currency,
+                scale = scale,
+                selectedCandidateId = payload.primaryCandidateId,
                 merchant = merchant,
                 itemSummary = "先用后付0元占坑，尚未实际扣款",
                 category = "忽略提醒",
                 paymentMethod = payMethod,
                 needsReview = false,
                 reasoning = "识别为先用后付0元下单/授权，遵循“认扣款不认占坑”原则自动忽略。",
-                aiModeUsed = "mock"
+                aiModeUsed = "local"
             )
         }
 
@@ -233,39 +303,65 @@ object AiClient {
             }
             return AiParseResult(
                 direction = TxDirection.INTERNAL_TRANSFER,
-                amount = amount,
+                amountMinor = amountMinor,
+                currency = currency,
+                scale = scale,
+                selectedCandidateId = payload.primaryCandidateId,
                 merchant = merchant,
                 itemSummary = extractItemSummary(text, merchant, TxDirection.INTERNAL_TRANSFER),
                 category = "内部流转",
                 paymentMethod = payMethod,
-                needsReview = false,
-                reasoning = internalReason,
-                aiModeUsed = "mock"
+                needsReview = payload.ambiguityReason != null,
+                reasoning = payload.ambiguityReason ?: internalReason,
+                aiModeUsed = "local"
             )
         }
 
-        // 3. Refund
+        // 3. AA split return or company reimbursement -> distinct REIMBURSEMENT_OFFSET (not merchant REFUND!)
+        val offsetKeywords = listOf("AA返还", "AA收款", "朋友返还", "分摊返还", "报销", "差旅报销", "垫付返还")
+        if (payload.roughDirection == "OFFSET" || offsetKeywords.any { text.contains(it, ignoreCase = true) }) {
+            val merchant = extractMerchant(text).let { if (it == "未知商户" && text.contains("报销")) "公司报销" else if (it == "未知商户") "AA分摊返还" else it }
+            return AiParseResult(
+                direction = TxDirection.REIMBURSEMENT_OFFSET,
+                amountMinor = amountMinor,
+                currency = currency,
+                scale = scale,
+                selectedCandidateId = payload.primaryCandidateId,
+                merchant = merchant,
+                itemSummary = extractItemSummary(text, merchant, TxDirection.REIMBURSEMENT_OFFSET),
+                category = "AA/报销冲抵",
+                paymentMethod = payMethod,
+                needsReview = payload.ambiguityReason != null,
+                reasoning = "识别为 AA 分摊返还或费用报销，独立冲抵个人净支出而不伪装成商户退款。",
+                aiModeUsed = "local"
+            )
+        }
+
+        // 4. Merchant Refund
         val refundKeywords = listOf("退款", "已退回", "退回原账户", "退货成功", "原路退回")
         if (payload.roughDirection == "REFUND" || refundKeywords.any { text.contains(it) }) {
             val merchant = extractMerchant(text)
             return AiParseResult(
                 direction = TxDirection.REFUND,
-                amount = amount,
+                amountMinor = amountMinor,
+                currency = currency,
+                scale = scale,
+                selectedCandidateId = payload.primaryCandidateId,
                 merchant = merchant,
                 itemSummary = extractItemSummary(text, merchant, TxDirection.REFUND),
                 category = "退款冲抵",
                 paymentMethod = payMethod,
-                needsReview = false,
+                needsReview = payload.ambiguityReason != null,
                 reasoning = "识别为商户退款，自动冲抵支出而不虚增收入。",
-                aiModeUsed = "mock"
+                aiModeUsed = "local"
             )
         }
 
-        // 4. Income vs Expense
-        val incomeCues = listOf("收款", "收入", "入账", "到账", "工资", "代发", "收到", "红包", "转入", "报销", "分红", "股息", "向你付款", "向您付款", "已存入")
-        val expenseCues = listOf("支出", "付款", "消费", "扣款", "支取", "划扣", "代扣", "实付", "支付成功", "向", "已付", "免密扣款", "自动续费", "转出")
+        // 5. Income vs Expense
+        val incomeCues = listOf("收款", "收入", "入账", "到账", "工资", "代发", "收到", "红包", "转入", "分红", "股息", "向你付款", "向您付款", "已存入")
+        val expenseCues = listOf("支出", "付款", "消费", "扣款", "支取", "划扣", "代扣", "实付", "支付成功", "向", "已付", "免密扣款", "自动续费", "转出", "分期购机", "垫付")
         val textWithoutPayer = text.replace("付款方", "").replace("付款人", "").replace("向你付款", "").replace("向您付款", "")
-        val strongExpenseCues = listOf("支付成功", "扣款", "付款给", "消费", "支取", "实付")
+        val strongExpenseCues = listOf("支付成功", "扣款", "付款给", "消费", "支取", "实付", "分期购机", "垫付")
 
         val direction: TxDirection
         val reasoning: String
@@ -275,6 +371,8 @@ object AiClient {
         } else if (payload.roughDirection == "OUT" || expenseCues.any { textWithoutPayer.contains(it) }) {
             direction = TxDirection.EXPENSE
             reasoning = when {
+                text.contains("分期购机") || text.contains("分期消费") ->
+                    "分期消费按消费时确认总额入账，后续本金还款按内部划转处理。"
                 listOf("花呗", "信用卡", "月付", "白条").any { text.contains(it) } ->
                     "信用支付单笔消费，按“消费时记支出、月底还款忽略”原则入账。"
                 listOf("免密", "极速", "乘车码", "自动扣款", "确认收货").any { text.contains(it) } ->
@@ -287,33 +385,39 @@ object AiClient {
         }
 
         val merchant = extractMerchant(text)
-        val needsReview = merchant == "未知商户" && reasoning.contains("模糊")
+        val needsReview = payload.ambiguityReason != null || (merchant == "未知商户" && reasoning.contains("模糊"))
 
         return AiParseResult(
             direction = direction,
-            amount = amount,
+            amountMinor = amountMinor,
+            currency = currency,
+            scale = scale,
+            selectedCandidateId = payload.primaryCandidateId,
             merchant = merchant,
             itemSummary = extractItemSummary(text, merchant, direction),
             category = inferCategory(text, merchant, direction),
             paymentMethod = payMethod,
             needsReview = needsReview,
-            reasoning = reasoning,
-            aiModeUsed = "mock"
+            reasoning = payload.ambiguityReason ?: reasoning,
+            aiModeUsed = "local"
         )
     }
 
     private fun detectInternalReason(text: String, profile: UserProfile): String? {
         val isMembershipOrPurchase = listOf("会员", "续费", "课程", "套餐", "商城", "软件").any { text.contains(it) }
+        val isDividend = listOf("分红", "股息").any { text.contains(it) }
         val hasTransferContext = listOf("转账", "存管", "转出", "转入", "划转", "证券", "保证金", "银证").any { text.contains(it) }
-        if (listOf("银证转账", "银行转证券", "证券转银行", "第三方存管", "资金存管").any { text.contains(it) }
-            || (!isMembershipOrPurchase && hasTransferContext && profile.brokers.any { text.contains(it) })
+        if (!isDividend && (listOf("银证转账", "银行转证券", "证券转银行", "第三方存管", "资金存管").any { text.contains(it) } ||
+                (!isMembershipOrPurchase && hasTransferContext && profile.brokers.any { text.contains(it) }))
         ) {
             return "银行与证券账户互转（银证转账），资产仍在本人名下。"
         }
-        if (listOf("信用卡还款", "花呗还款", "白条还款", "月付还款", "自动还款", "账单还款").any { text.contains(it) }) {
+        if (listOf("信用卡还款", "花呗还款", "白条还款", "月付还款", "自动还款", "账单还款", "分期还款").any { text.contains(it) }) {
             return "信用账单还款，消费时已记账，还款属于内部流转。"
         }
-        if (listOf("零钱提现", "余额提现", "提现至", "提现到", "零钱充值", "余额充值").any { text.contains(it) }) {
+        if (listOf("零钱提现", "余额提现", "提现至", "提现到", "零钱充值", "余额充值", "提现").any { text.contains(it) } &&
+            listOf("话费充值", "水费充值", "电费充值", "燃气充值", "油卡充值", "会员充值", "游戏充值").none { text.contains(it) }
+        ) {
             return "本人钱包与银行卡之间的充值/提现，属于内部流转。"
         }
         if (listOf("余额宝转入", "余额宝转出", "零钱通转入", "零钱通转出", "朝朝宝", "货币基金申购", "基金赎回", "理财申购", "理财赎回").any { text.contains(it) }) {
@@ -332,16 +436,12 @@ object AiClient {
     }
 
     internal fun extractMerchant(text: String): String {
-        val ignoredTokens = setOf(
-            "微信支付", "支付宝", "人民币", "银行卡", "账户", "您", "你的",
-            "财付通", "网联", "银联", "银联商务", "财付通支付科技有限公司", "快捷支付"
-        )
         for (pat in merchantPatterns) {
             val m = pat.find(text) ?: continue
             var candidate = m.groupValues[1].trim('：', ':', '(', ')', '（', '）', '[', ']', '【', '】')
             candidate = acquirerPrefixRegex.replace(candidate, "").trim()
             candidate = trailingVerbRegex.replace(candidate, "").trim()
-            if (candidate.length >= 2 && candidate !in ignoredTokens) {
+            if (candidate.length >= 2 && candidate !in GENERIC_GATEWAY_MERCHANTS) {
                 return candidate
             }
         }
@@ -355,6 +455,7 @@ object AiClient {
         itemRegex.find(text)?.let { return it.groupValues[1].trim() }
         return when (direction) {
             TxDirection.REFUND -> "$merchant 订单退款"
+            TxDirection.REIMBURSEMENT_OFFSET -> if (text.contains("报销")) "费用报销冲抵" else "AA 分摊返还冲抵"
             TxDirection.INTERNAL_TRANSFER -> when {
                 text.contains("银证") || text.contains("证券") -> "银行卡与证券账户互转"
                 text.contains("还款") -> "信用账单还款"
@@ -370,6 +471,7 @@ object AiClient {
                 text.contains("乘车") || text.contains("地铁") || text.contains("公交") -> "公共交通乘车扣费"
                 text.contains("续费") || text.contains("会员") -> "$merchant 自动续费/会员"
                 text.contains("充电宝") || text.contains("怪兽充电") -> "共享充电宝结算"
+                text.contains("分期购机") -> "分期购机消费"
                 else -> "$merchant 交易"
             }
         }
@@ -380,10 +482,11 @@ object AiClient {
             TxDirection.INTERNAL_TRANSFER -> "内部流转"
             TxDirection.IGNORED -> "忽略提醒"
             TxDirection.REFUND -> "退款冲抵"
+            TxDirection.REIMBURSEMENT_OFFSET -> "AA/报销冲抵"
             TxDirection.INCOME -> when {
                 listOf("工资", "薪资", "代发", "奖金", "绩效").any { text.contains(it) } -> "工资收入"
                 listOf("分红", "股息", "利息", "收益").any { text.contains(it) } -> "投资收益"
-                listOf("转账", "红包", "AA", "收款").any { text.contains(it) } -> "人情转账"
+                listOf("转账", "红包", "收款").any { text.contains(it) } -> "人情转账"
                 else -> "副业/其他收入"
             }
             TxDirection.EXPENSE -> {
@@ -393,6 +496,4 @@ object AiClient {
             }
         }
     }
-
-    private fun round2(v: Double): Double = (v * 100.0).roundToLong() / 100.0
 }

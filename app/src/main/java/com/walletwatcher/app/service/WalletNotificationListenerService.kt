@@ -103,6 +103,7 @@ class WalletNotificationListenerService : NotificationListenerService() {
             subMessages = if (isGroupSummary) newLines else emptyList()
         )
 
+        app.lastObservedEventAtMs = System.currentTimeMillis()
         app.appScope.launch {
             runCatching {
                 app.engine.ingestNotification(raw)

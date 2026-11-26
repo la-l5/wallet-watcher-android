@@ -1,4 +1,4 @@
-name: Build Android Debug APK
+name: Android CI & Debug APK
 
 on:
   push:
@@ -33,34 +33,40 @@ jobs:
             yes | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
           fi
 
-      - name: Run Offline Unit Tests
+      - name: Run Pure JVM & Robolectric SQLite Unit Tests
         run: |
           gradle testDebugUnitTest --stacktrace
           python3 - <<'PY'
           import glob, xml.etree.ElementTree as ET
-          suites = [ET.parse(f).getroot() for f in glob.glob("app/build/test-results/testDebugUnitTest/TEST-*.xml")]
-          passed = sum(int(s.get("tests")) - int(s.get("skipped", 0)) for s in suites)
-          assert passed > 0
-          print(f"Verified JVM tests passed: {passed}")
+          files = sorted(glob.glob("app/build/test-results/testDebugUnitTest/TEST-*.xml"))
+          assert files, "No test XML files generated"
+          total = 0
+          for f in files:
+              root = ET.parse(f).getroot()
+              tests = int(root.get("tests", 0))
+              failures = int(root.get("failures", 0))
+              errors = int(root.get("errors", 0))
+              skipped = int(root.get("skipped", 0))
+              assert failures == 0 and errors == 0, f"Test failure in {f}"
+              passed = tests - skipped
+              total += passed
+              print(f"{root.get('name')}: {passed} passed")
+          assert total > 0
+          print(f"Verified total unit tests passed: {total}")
           PY
 
-      - name: Build Debug APK (with Secret API Key Injection)
-        env:
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          DEEPSEEK_BASE_URL: ${{ vars.DEEPSEEK_BASE_URL || 'https://api.deepseek.com' }}
-          DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL || 'deepseek-chat' }}
+      - name: Build Debug APK (Coexists with Release via .debug suffix, Zero Baked Keys)
         run: |
-          if [ -z "${DEEPSEEK_API_KEY}" ]; then
-            echo "::warning::Repository Secret DEEPSEEK_API_KEY is not set. APK will build without a baked-in key (you can still fill it inside the app Settings)."
-          fi
-          gradle assembleDebug --no-build-cache --no-configuration-cache --rerun-tasks
+          gradle assembleDebug --no-build-cache --no-configuration-cache
           python3 - <<'PY'
-          import os, zipfile
-          key = os.environ["DEEPSEEK_API_KEY"].encode()
-          if key:
-              with zipfile.ZipFile("app/build/outputs/apk/debug/app-debug.apk") as apk:
-                  if not any(key in apk.read(n) for n in apk.namelist() if n.endswith(".dex")):
-                      raise SystemExit("Configured key missing from packaged DEX")
+          import hashlib, re, zipfile
+          apk_path = "app/build/outputs/apk/debug/app-debug.apk"
+          with open(apk_path, "rb") as f:
+              print("Debug APK File SHA-256:", hashlib.sha256(f.read()).hexdigest())
+          key_pattern = re.compile(rb"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9]{20,}")
+          with zipfile.ZipFile(apk_path) as apk:
+              dex_blobs = [apk.read(n) for n in apk.namelist() if n.endswith(".dex")]
+              assert not any(key_pattern.search(blob) for blob in dex_blobs), "Unexpected API key pattern found in DEX"
           PY
 
       - name: Upload Debug APK

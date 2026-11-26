@@ -23,7 +23,7 @@
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:text="钱包自动记账 · 真机测试版"
+                android:text="钱包自动记账 · 开源公测底座"
                 android:textColor="#FFFFFF"
                 android:textSize="17sp"
                 android:textStyle="bold" />
@@ -35,7 +35,7 @@
                 android:layout_height="36dp"
                 android:minWidth="0dp"
                 android:paddingHorizontal="10dp"
-                android:text="设置/API"
+                android:text="设置/备份"
                 android:textColor="#FFFFFF"
                 android:textSize="12sp" />
         </LinearLayout>
@@ -71,7 +71,7 @@
                 android:layout_height="36dp"
                 android:layout_marginEnd="6dp"
                 android:layout_weight="1"
-                android:text="荣耀保活"
+                android:text="状态与保活"
                 android:textSize="12sp" />
 
             <Button

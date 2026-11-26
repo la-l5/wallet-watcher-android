@@ -10,12 +10,25 @@ val localProps = Properties().apply {
     if (f.exists()) f.inputStream().use { load(it) }
 }
 
-fun secretOrDefault(name: String, fallback: String = ""): String {
-    val raw = System.getenv(name)?.takeIf { it.isNotBlank() }
+fun propOrEnv(name: String, fallback: String = ""): String {
+    return System.getenv(name)?.takeIf { it.isNotBlank() }
         ?: localProps.getProperty(name)?.takeIf { it.isNotBlank() }
         ?: fallback
-    return raw.replace("\\", "\\\\").replace("\"", "\\\"")
 }
+
+fun quoted(value: String): String {
+    val escaped = value.replace("\\", "\\\\").replace("\"", "\\\"")
+    return "\"$escaped\""
+}
+
+val releaseKeystorePath = propOrEnv("RELEASE_KEYSTORE_PATH")
+val releaseKeystorePassword = propOrEnv("RELEASE_KEYSTORE_PASSWORD")
+val releaseKeyAlias = propOrEnv("RELEASE_KEY_ALIAS")
+val releaseKeyPassword = propOrEnv("RELEASE_KEY_PASSWORD")
+val hasReleaseSigning = releaseKeystorePath.isNotBlank() &&
+    releaseKeystorePassword.isNotBlank() &&
+    releaseKeyAlias.isNotBlank() &&
+    releaseKeyPassword.isNotBlank()
 
 android {
     namespace = "com.walletwatcher.app"
@@ -25,12 +38,27 @@ android {
         applicationId = "com.walletwatcher.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0-mvp"
+        versionCode = 2
+        versionName = "0.2.0-beta.1"
 
-        buildConfigField("String", "DEFAULT_AI_BASE_URL", "\"${secretOrDefault("DEEPSEEK_BASE_URL", "https://api.deepseek.com")}\"")
-        buildConfigField("String", "DEFAULT_AI_MODEL", "\"${secretOrDefault("DEEPSEEK_MODEL", "deepseek-chat")}\"")
-        buildConfigField("String", "DEFAULT_AI_API_KEY", "\"${secretOrDefault("DEEPSEEK_API_KEY", "")}\"")
+        // Public open-source builds never bake an author API key into the APK.
+        buildConfigField("String", "DEFAULT_AI_BASE_URL", quoted("https://api.deepseek.com"))
+        buildConfigField("String", "DEFAULT_AI_MODEL", quoted("deepseek-chat"))
+        buildConfigField("String", "DEFAULT_AI_API_KEY", quoted(""))
+    }
+
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = file(releaseKeystorePath)
+                storePassword = releaseKeystorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+                enableV1Signing = true
+                enableV2Signing = true
+                enableV3Signing = true
+            }
+        }
     }
 
     buildFeatures {
@@ -38,8 +66,15 @@ android {
     }
 
     buildTypes {
+        debug {
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-debug"
+        }
         release {
             isMinifyEnabled = false
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -57,7 +92,10 @@ android {
     }
 
     testOptions {
-        unitTests.isReturnDefaultValues = true
+        unitTests {
+            isIncludeAndroidResources = true
+            isReturnDefaultValues = true
+        }
     }
 }
 
@@ -70,4 +108,6 @@ dependencies {
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
+    testImplementation("org.robolectric:robolectric:4.14.1")
+    testImplementation("androidx.test:core:1.6.1")
 }

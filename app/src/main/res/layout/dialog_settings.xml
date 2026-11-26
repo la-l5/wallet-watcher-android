@@ -47,20 +47,20 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="14dp"
-            android:text="二、大模型 API 配置（默认启用 DeepSeek，可随时更换 Key 或模型）"
+            android:text="二、可选大模型 API（默认纯离线运行，零遥测，不内置作者 Key）"
             android:textStyle="bold" />
 
         <CheckBox
             android:id="@+id/cbUseRealApi"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="启用真实大模型 API（默认开启 DeepSeek）" />
+            android:text="启用自有 OpenAI 兼容 API（取消勾选则完全离线零网络请求）" />
 
         <EditText
             android:id="@+id/etBaseUrl"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="Base URL（默认 https://api.deepseek.com）"
+            android:hint="HTTPS Base URL（默认 https://api.deepseek.com）"
             android:inputType="textUri" />
 
         <EditText
@@ -74,8 +74,39 @@
             android:id="@+id/etApiKey"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="API Key（若通过 GitHub Secret 编译已自动注入，可在此覆盖）"
+            android:hint="自有 API Key（仅存本机，不进入加密备份）"
             android:inputType="textPassword" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="14dp"
+            android:text="三、加密逻辑快照备份与恢复（AES-256-GCM，不含 API Key）"
+            android:textStyle="bold" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/btnExportBackup"
+                android:layout_width="0dp"
+                android:layout_height="38dp"
+                android:layout_marginEnd="6dp"
+                android:layout_weight="1"
+                android:text="导出加密备份"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/btnRestoreBackup"
+                android:layout_width="0dp"
+                android:layout_height="38dp"
+                android:layout_weight="1"
+                android:text="校验并恢复备份"
+                android:textSize="12sp" />
+        </LinearLayout>
 
     </LinearLayout>
 </ScrollView>
