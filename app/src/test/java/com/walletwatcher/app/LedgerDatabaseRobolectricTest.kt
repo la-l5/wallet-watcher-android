@@ -328,6 +328,11 @@ class LedgerDatabaseRobolectricTest {
             assertTrue(engine.undoChange(mergeOp.opId))
             assertFalse(db.hasActiveSourceExternalId(detail.externalId!!))
             assertEquals(1, db.listSourcesForTransaction(original.id).size)
+
+            // Updating an existing transaction in-place (e.g. markAsInternal) MUST preserve its source links!
+            val afterUndo = db.getTransaction(original.id)!!
+            assertNotNull(engine.markAsInternal(afterUndo.id, expectedRevision = afterUndo.revision))
+            assertEquals(1, db.listSourcesForTransaction(original.id).size)
         } finally {
             db.close()
         }

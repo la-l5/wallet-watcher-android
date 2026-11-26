@@ -923,7 +923,6 @@ class LedgerDatabase(
 
     private fun insertTransaction(db: SQLiteDatabase, tx: Transaction) {
         val cv = ContentValues().apply {
-            put("id", tx.id)
             put("occurred_at_ms", tx.occurredAtMs)
             put("observed_at_ms", tx.observedAtMs)
             put("updated_at_ms", tx.updatedAtMs)
@@ -954,12 +953,18 @@ class LedgerDatabase(
             put("legacy_merged_count", tx.legacyMergedCount)
             put("legacy_missing_sources", if (tx.legacyMissingSources) 1 else 0)
         }
-        db.insertWithOnConflict("transactions", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
+        // IMPORTANT: Never use CONFLICT_REPLACE on parent tables referenced by ON DELETE CASCADE.
+        // With PRAGMA foreign_keys=ON, INSERT OR REPLACE deletes the row first and silently wipes
+        // existing transaction_source_links! Update-in-place preserves all child links safely.
+        val updated = db.update("transactions", cv, "id = ?", arrayOf(tx.id))
+        if (updated == 0) {
+            cv.put("id", tx.id)
+            db.insertOrThrow("transactions", null, cv)
+        }
     }
 
     private fun insertSource(db: SQLiteDatabase, s: TransactionSource) {
         val cv = ContentValues().apply {
-            put("id", s.id)
             put("source_type", s.sourceType)
             put("app_package", s.appPackage)
             put("app_name", s.appName)
@@ -973,7 +978,12 @@ class LedgerDatabase(
             put("merchant_hint", s.merchantHint)
             put("channel_label", s.channelLabel)
         }
-        db.insertWithOnConflict("transaction_sources", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
+        // Update-in-place prevents CONFLICT_REPLACE from firing ON DELETE CASCADE on transaction_source_links.
+        val updated = db.update("transaction_sources", cv, "id = ?", arrayOf(s.id))
+        if (updated == 0) {
+            cv.put("id", s.id)
+            db.insertOrThrow("transaction_sources", null, cv)
+        }
     }
 
     private fun insertLink(db: SQLiteDatabase, l: TransactionSourceLink) {
