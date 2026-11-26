@@ -1577,7 +1577,7 @@ class LedgerEngineCoreTest {
         // Inspect the EXACT serialized JSON request body that would be sent to an optional cloud LLM
         val queuedPayload = store.listOfflineQueue().single().payload
         val cloudBodyJson = AiClient.buildCloudRequestBody(
-            AiConfig(mode = AiConfig.MODE_REAL_API, baseUrl = "https://api.example.com/v1", apiKey = "test", model = "test-model"),
+            AiConfig(mode = AiConfig.MODE_OPENAI_COMPATIBLE, baseUrl = "https://api.example.com/v1", apiKey = "test", model = "test-model"),
             queuedPayload
         ).toString()
         assertFalse("Private item sentinel MUST NOT appear in any cloud request field", cloudBodyJson.contains(sentinel))
@@ -1605,7 +1605,7 @@ class LedgerEngineCoreTest {
 
         val multiPayload = store2.listOfflineQueue().single().payload
         val multiCloudJson = AiClient.buildCloudRequestBody(
-            AiConfig(mode = AiConfig.MODE_REAL_API, baseUrl = "https://api.example.com/v1", apiKey = "test", model = "test-model"),
+            AiConfig(mode = AiConfig.MODE_OPENAI_COMPATIBLE, baseUrl = "https://api.example.com/v1", apiKey = "test", model = "test-model"),
             multiPayload
         ).toString()
         assertFalse("Trailing free-text node '送给小林' MUST NOT appear anywhere in cloud JSON", multiCloudJson.contains("送给小林"))
