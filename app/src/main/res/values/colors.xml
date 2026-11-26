@@ -7,4 +7,10 @@
     <color name="income_green">#059669</color>
     <color name="refund_blue">#2563EB</color>
     <color name="surface">#FFFFFF</color>
+    <color name="status_ok_bg">#DCFCE7</color>
+    <color name="status_ok_text">#15803D</color>
+    <color name="status_warn_bg">#FEF3C7</color>
+    <color name="status_warn_text">#B45309</color>
+    <color name="status_opt_bg">#E2E8F0</color>
+    <color name="status_opt_text">#475569</color>
 </resources>

@@ -32,12 +32,14 @@ class WalletNotificationListenerService : NotificationListenerService() {
         app.isListenerConnected = true
         app.engine.store.addLog("SERVICE", "通知监听服务已连接，开始后台守护")
         startGuardForegroundNotification()
+        app.notifyServiceStateChanged()
     }
 
     override fun onListenerDisconnected() {
         super.onListenerDisconnected()
         app.isListenerConnected = false
         app.engine.store.addLog("SERVICE", "通知监听服务已断开（若在荣耀手机上频繁出现，请检查电池与启动管理白名单）")
+        app.notifyServiceStateChanged()
     }
 
     override fun onNotificationRemoved(sbn: StatusBarNotification?) {

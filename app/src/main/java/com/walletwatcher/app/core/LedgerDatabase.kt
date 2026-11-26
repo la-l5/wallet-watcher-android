@@ -26,6 +26,14 @@ interface LedgerStore {
     fun listTransactions(limit: Int = 300): List<Transaction>
     fun listSourcesForTransaction(txId: String): List<Pair<TransactionSource, TransactionSourceLink>>
     fun listLinksForSource(sourceId: String): List<TransactionSourceLink>
+    fun hasActiveSourceExternalId(externalId: String): Boolean
+    fun hasActiveSourceFingerprint(shortFingerprint: String): Boolean
+    fun findBackfillCandidates(
+        amountMinor: Long,
+        currency: String,
+        sinceMs: Long,
+        untilMs: Long
+    ): List<Transaction>
     fun listAllSources(): List<TransactionSource>
     fun listAllLinks(): List<TransactionSourceLink>
     fun listChanges(limit: Int = 200): List<TransactionChange>
@@ -446,6 +454,61 @@ class LedgerDatabase(
             arrayOf(sourceId)
         ).use { c ->
             while (c.moveToNext()) out.add(cursorToLink(c))
+        }
+        out
+    }
+
+    override fun hasActiveSourceExternalId(externalId: String): Boolean = synchronized(lock) {
+        if (externalId.isBlank()) return@synchronized false
+        readableDatabase.rawQuery(
+            """
+            SELECT 1
+            FROM transaction_sources s
+            INNER JOIN transaction_source_links l ON l.source_id = s.id
+            INNER JOIN transactions t ON t.id = l.transaction_id
+            WHERE s.external_id = ?
+              AND t.status != 'REVERTED'
+            LIMIT 1
+            """.trimIndent(),
+            arrayOf(externalId)
+        ).use { c -> c.moveToFirst() }
+    }
+
+    override fun hasActiveSourceFingerprint(shortFingerprint: String): Boolean = synchronized(lock) {
+        if (shortFingerprint.isBlank()) return@synchronized false
+        readableDatabase.rawQuery(
+            """
+            SELECT 1
+            FROM transaction_sources s
+            INNER JOIN transaction_source_links l ON l.source_id = s.id
+            INNER JOIN transactions t ON t.id = l.transaction_id
+            WHERE s.short_fingerprint = ?
+              AND t.status != 'REVERTED'
+            LIMIT 1
+            """.trimIndent(),
+            arrayOf(shortFingerprint)
+        ).use { c -> c.moveToFirst() }
+    }
+
+    override fun findBackfillCandidates(
+        amountMinor: Long,
+        currency: String,
+        sinceMs: Long,
+        untilMs: Long
+    ): List<Transaction> = synchronized(lock) {
+        val out = mutableListOf<Transaction>()
+        readableDatabase.rawQuery(
+            """
+            SELECT * FROM transactions
+            WHERE status IN ('RECORDED', 'NEEDS_REVIEW')
+              AND currency = ?
+              AND amount_minor = ?
+              AND occurred_at_ms BETWEEN ? AND ?
+            ORDER BY occurred_at_ms DESC
+            """.trimIndent(),
+            arrayOf(currency, amountMinor.toString(), sinceMs.toString(), untilMs.toString())
+        ).use { c ->
+            while (c.moveToNext()) out.add(cursorToTx(c))
         }
         out
     }

@@ -16,13 +16,25 @@ class LedgerEngine(
     private val nowProvider: () -> Long = { System.currentTimeMillis() },
     private val parse: (AiConfig, UserProfile, MergedPayload) -> AiParseResult = AiClient::parse
 ) {
-    private val bufferLock = Any()
-    private val finalizeLock = Any()
+    private sealed class DeferredEvent {
+        data class Notif(val raw: RawNotification) : DeferredEvent()
+        data class Screen(val capture: ScreenBillCapture) : DeferredEvent()
+    }
+
+    private enum class BackfillResult {
+        ALREADY_EXISTS,
+        BACKFILLED,
+        AMBIGUOUS,
+        NO_MATCH
+    }
+
+    // Strict lock hierarchy: replayLock -> finalizeLock -> bufferLock
     private val replayLock = Any()
-    private val restoreLock = Any()
+    private val finalizeLock = Any()
+    private val bufferLock = Any()
     private val buffers = LinkedHashMap<String, BufferedGroup>()
     private val delivered = LinkedHashMap<Pair<String, String>, Pair<Long, Pair<String, String>>>()
-    private val deferredDuringRestore = mutableListOf<RawNotification>()
+    private val deferredDuringRestore = mutableListOf<DeferredEvent>()
     private val changeListeners = CopyOnWriteArrayList<() -> Unit>()
 
     @Volatile
@@ -66,14 +78,16 @@ class LedgerEngine(
 
     /**
      * Pauses ingestion, flushing, and queue replay while an atomic database restore executes.
-     * Notifications arriving mid-restore are buffered in memory and replayed after switch completes.
+     * Events arriving mid-restore preserve their original type and are ALWAYS replayed after the
+     * restore outcome is settled (both on success and on failure/rollback).
      */
     fun <T> withRestoreBarrier(block: () -> T): T {
-        val pendingAfterRestore: List<RawNotification>
-        val result: T
+        val pendingAfterRestore: List<DeferredEvent>
+        var result: T? = null
+        var failure: Throwable? = null
         synchronized(replayLock) {
             synchronized(finalizeLock) {
-                synchronized(restoreLock) {
+                synchronized(bufferLock) {
                     restoring = true
                 }
                 try {
@@ -84,8 +98,10 @@ class LedgerEngine(
                     }
                     profile = store.loadProfile()
                     aiConfig = store.loadAiConfig()
+                } catch (t: Throwable) {
+                    failure = t
                 } finally {
-                    synchronized(restoreLock) {
+                    synchronized(bufferLock) {
                         restoring = false
                         pendingAfterRestore = deferredDuringRestore.toList()
                         deferredDuringRestore.clear()
@@ -93,17 +109,38 @@ class LedgerEngine(
                 }
             }
         }
-        for (notif in pendingAfterRestore) {
-            ingestNotification(notif)
+        var failedReplays = 0
+        var lastReplayError: String? = null
+        for (ev in pendingAfterRestore) {
+            val replayRes = runCatching {
+                when (ev) {
+                    is DeferredEvent.Notif -> ingestNotification(ev.raw)
+                    is DeferredEvent.Screen -> ingestScreenCapture(ev.capture)
+                }
+            }
+            if (replayRes.isFailure) {
+                failedReplays++
+                lastReplayError = replayRes.exceptionOrNull()?.javaClass?.simpleName ?: "UnknownError"
+            }
+        }
+        if (failedReplays > 0) {
+            runCatching {
+                store.addLog(
+                    "RESTORE_REPLAY_ERR",
+                    "恢复屏障结束后有 $failedReplays 条延迟事件重放失败（最后异常：$lastReplayError）"
+                )
+            }
         }
         notifyChanged()
-        return result
+        failure?.let { throw it }
+        @Suppress("UNCHECKED_CAST")
+        return result as T
     }
 
     fun ingestNotification(notif: RawNotification) {
-        synchronized(restoreLock) {
+        synchronized(bufferLock) {
             if (restoring) {
-                deferredDuringRestore.add(notif)
+                deferredDuringRestore.add(DeferredEvent.Notif(notif))
                 return
             }
         }
@@ -124,6 +161,494 @@ class LedgerEngine(
             return
         }
         ingestSingle(notif)
+    }
+
+    /**
+     * Concurrency-safe ingestion of a read-only accessibility screen capture.
+     * - Serialized under finalizeLock (obeying replayLock -> finalizeLock -> bufferLock).
+     * - BILL_DETAIL can ONLY merge into an existing buffer or backfill a uniquely matched committed tx
+     *   with a reliable page transaction timestamp; it has NO code path to create a new transaction.
+     * - Live PAY_SUCCESS / RECEIVE_SUCCESS checks active externalId idempotency across both buffers
+     *   and committed active links before attempting buffer merge, backfill, or new enqueue.
+     */
+    fun ingestScreenCapture(capture: ScreenBillCapture): ScreenIngestOutcome {
+        val raw = capture.toRawNotification()
+        val clue = extractClue(raw)
+        if (clue.amountMinor == null) return ScreenIngestOutcome.IGNORED
+
+        val outcome = synchronized(replayLock) {
+            synchronized(finalizeLock) {
+                val extId = capture.externalId
+                val rcptKey = capture.receiptDedupKey
+
+                // 0. Check restore barrier before any read/write (restoring cannot toggle while finalizeLock is held)
+                val deferredAtEntry = synchronized(bufferLock) {
+                    if (restoring) {
+                        deferredDuringRestore.add(DeferredEvent.Screen(capture))
+                        true
+                    } else {
+                        false
+                    }
+                }
+                if (deferredAtEntry) return@synchronized ScreenIngestOutcome.DEFERRED_RESTORE
+
+                // 1. BILL_DETAIL pre-check BEFORE touching any buffer or DB:
+                //    must carry a reliable page transaction timestamp; never match/merge using browse time!
+                if (capture.pageKind == ScreenPageKind.BILL_DETAIL && capture.eventTimeMs == null) {
+                    store.addLog(
+                        "SCREEN_SKIP",
+                        "账单详情页(${capture.appName} ${MoneyMath.formatUnsignedMinor(capture.amountMinor, capture.currency, capture.scale)})缺少可信交易时间，已跳过自动回填"
+                    )
+                    return@synchronized ScreenIngestOutcome.SKIPPED_NO_MATCH
+                }
+
+                // 2. Check active externalId & dual-second receiptDedupKey idempotency in DB BEFORE touching buffers
+                if (!extId.isNullOrBlank() && store.hasActiveSourceExternalId(extId)) {
+                    return@synchronized ScreenIngestOutcome.ALREADY_EXISTS
+                }
+                if (!rcptKey.isNullOrBlank() && store.hasActiveSourceFingerprint(rcptKey)) {
+                    return@synchronized ScreenIngestOutcome.ALREADY_EXISTS
+                }
+
+                // 3. Atomic check for in-buffer idempotency and screen-safe buffer merge
+                val bufferStep = synchronized(bufferLock) {
+                    if (!extId.isNullOrBlank()) {
+                        val inBuffer = buffers.values.any { g -> g.clues.any { it.raw.externalId == extId } }
+                        if (inBuffer) return@synchronized ScreenIngestOutcome.ALREADY_EXISTS
+                    }
+                    if (!rcptKey.isNullOrBlank()) {
+                        val inBuffer = buffers.values.any { g -> g.clues.any { it.sourceRecord.shortFingerprint == rcptKey } }
+                        if (inBuffer) return@synchronized ScreenIngestOutcome.ALREADY_EXISTS
+                    }
+                    tryMergeScreenIntoExistingBufferLocked(capture, raw, clue)
+                }
+                if (bufferStep != null) return@synchronized bufferStep
+
+                // 4. Attempt atomic in-place backfill against a uniquely matched committed transaction
+                when (tryBackfillCommittedLocked(capture, raw, clue)) {
+                    BackfillResult.ALREADY_EXISTS -> return@synchronized ScreenIngestOutcome.ALREADY_EXISTS
+                    BackfillResult.BACKFILLED -> return@synchronized ScreenIngestOutcome.BACKFILLED_COMMITTED
+                    BackfillResult.AMBIGUOUS -> {
+                        if (capture.pageKind == ScreenPageKind.BILL_DETAIL) {
+                            return@synchronized ScreenIngestOutcome.SKIPPED_AMBIGUOUS
+                        }
+                    }
+                    BackfillResult.NO_MATCH -> {
+                        if (capture.pageKind == ScreenPageKind.BILL_DETAIL) {
+                            store.addLog(
+                                "SCREEN_SKIP",
+                                "账单详情页(${capture.appName} ${MoneyMath.formatUnsignedMinor(capture.amountMinor, capture.currency, capture.scale)})未匹配到可回填账单，未新增记录"
+                            )
+                            return@synchronized ScreenIngestOutcome.SKIPPED_NO_MATCH
+                        }
+                    }
+                }
+
+                // 4b. Guard against re-opening an old (>5 min) WeChat transfer receipt bubble without creating a duplicate tx
+                if (capture.pageKind == ScreenPageKind.RECEIVE_SUCCESS &&
+                    capture.eventTimeMs != null &&
+                    (capture.observedAtMs - capture.eventTimeMs) > 300_000L
+                ) {
+                    store.addLog(
+                        "SCREEN_SKIP",
+                        "收款详情时间早于当前 5 分钟(${capture.appName} ${MoneyMath.formatUnsignedMinor(capture.amountMinor, capture.currency, capture.scale)})，判定为翻看历史气泡，未重复入账"
+                    )
+                    return@synchronized ScreenIngestOutcome.SKIPPED_NO_MATCH
+                }
+
+                // 5. Only live PAY_SUCCESS / recent RECEIVE_SUCCESS may enqueue a brand-new transaction
+                val deferred = synchronized(bufferLock) {
+                    if (restoring) {
+                        deferredDuringRestore.add(DeferredEvent.Screen(capture))
+                        true
+                    } else {
+                        enqueueIntoBufferLocked(raw, clue)
+                        false
+                    }
+                }
+                if (deferred) ScreenIngestOutcome.DEFERRED_RESTORE else ScreenIngestOutcome.ENQUEUED_NEW
+            }
+        }
+
+        if (outcome == ScreenIngestOutcome.MERGED_INTO_BUFFER ||
+            outcome == ScreenIngestOutcome.BACKFILLED_COMMITTED ||
+            outcome == ScreenIngestOutcome.ENQUEUED_NEW
+        ) {
+            notifyChanged()
+        }
+        return outcome
+    }
+
+    /**
+     * Merges a screen capture into an ALREADY EXISTING matching buffer under bufferLock.
+     * - Enforces strong externalId conflict isolation, cross-platform isolation (WeChat != Alipay),
+     *   strict acquirer/channel match for BILL_DETAIL, and unique-candidate requirement for BILL_DETAIL.
+     * - Never creates a new buffer.
+     */
+    private fun tryMergeScreenIntoExistingBufferLocked(
+        capture: ScreenBillCapture,
+        raw: RawNotification,
+        clue: ParsedClue
+    ): ScreenIngestOutcome? {
+        val key = raw.appPackage to raw.notificationId
+        val event = raw.timestampMs to (raw.title to raw.content)
+        if (delivered[key] == event) return ScreenIngestOutcome.ALREADY_EXISTS
+
+        val amountMinor = clue.amountMinor ?: return null
+        val refTime = if (capture.pageKind == ScreenPageKind.BILL_DETAIL) {
+            capture.eventTimeMs ?: return ScreenIngestOutcome.SKIPPED_NO_MATCH
+        } else {
+            capture.eventTimeMs ?: capture.observedAtMs
+        }
+        val extId = capture.externalId
+        val screenMerchant = notificationMerchant(raw)
+
+        val candidates = buffers.values.filter { group ->
+            if (abs(refTime - group.createdAtMs) > dedupWindowMs) return@filter false
+            val gAmt = group.amountMinor ?: return@filter false
+            if (gAmt != amountMinor || group.currency != clue.currency) return@filter false
+
+            val sameDir = group.roughDirection == clue.roughDirection ||
+                group.roughDirection == "UNKNOWN" || clue.roughDirection == "UNKNOWN" ||
+                (group.roughDirection == "REFUND" && clue.roughDirection == "IN") ||
+                (group.roughDirection == "IN" && clue.roughDirection == "REFUND")
+            if (!sameDir) return@filter false
+
+            // Never merge into a buffer carrying a DIFFERENT genuine platform order ID
+            if (!extId.isNullOrBlank()) {
+                val conflictingOrder = group.clues.any {
+                    !it.raw.externalId.isNullOrBlank() && it.raw.externalId != extId
+                }
+                if (conflictingOrder) return@filter false
+            }
+
+            // Never merge WeChat capture into Alipay buffer or vice versa
+            val otherPlatform = if (capture.appPackage == ScreenBillParser.PKG_WECHAT) {
+                ScreenBillParser.PKG_ALIPAY
+            } else {
+                ScreenBillParser.PKG_WECHAT
+            }
+            if (group.clues.any { it.raw.appPackage == otherPlatform }) return@filter false
+
+            // For BILL_DETAIL, require explicit same-platform or acquirer tag match on the buffer
+            if (capture.pageKind == ScreenPageKind.BILL_DETAIL) {
+                val channelMatches = group.clues.any { prior ->
+                    prior.raw.appPackage == capture.appPackage ||
+                        matchesPlatformAcquirer(capture.appPackage, "${prior.raw.title} ${prior.raw.content}")
+                }
+                if (!channelMatches) return@filter false
+            }
+
+            if (group.clues.any { it.cardTail != null && clue.cardTail != null && it.cardTail != clue.cardTail }) {
+                return@filter false
+            }
+
+            val merchantConflict = group.clues.any { prior ->
+                val other = notificationMerchant(prior.raw)
+                !isGenericMerchantName(screenMerchant) &&
+                    !isGenericMerchantName(other) &&
+                    !screenMerchant.contains(other) &&
+                    !other.contains(screenMerchant)
+            }
+            if (merchantConflict) return@filter false
+
+            // Avoid merging a second accessibility capture from the same app into the same buffer
+            val existingSources = group.clues.map { it.raw.appPackage to it.raw.sourceType }.toSet()
+            if ((raw.appPackage to raw.sourceType) in existingSources) return@filter false
+
+            true
+        }
+
+        if (candidates.isEmpty()) return null
+        if (capture.pageKind == ScreenPageKind.BILL_DETAIL && candidates.size > 1) {
+            store.addLog(
+                "SCREEN_SKIP",
+                "缓冲窗内存在 ${candidates.size} 笔同额候选，详情页为防错配跳过合并"
+            )
+            return ScreenIngestOutcome.SKIPPED_AMBIGUOUS
+        }
+
+        val matched = if (candidates.size == 1) {
+            candidates.single()
+        } else {
+            candidates.minBy { abs(refTime - it.createdAtMs) }
+        }
+        mergeClueIntoBufferLocked(matched, raw, clue, key, event)
+        return ScreenIngestOutcome.MERGED_INTO_BUFFER
+    }
+
+    private fun tryMergeIntoExistingBufferLocked(raw: RawNotification, clue: ParsedClue): Boolean {
+        val key = raw.appPackage to raw.notificationId
+        val event = raw.timestampMs to (raw.title to raw.content)
+        if (delivered[key] == event) return false
+
+        val matched = findMatchingBuffer(clue, raw.timestampMs) ?: return false
+        mergeClueIntoBufferLocked(matched, raw, clue, key, event)
+        return true
+    }
+
+    private fun mergeClueIntoBufferLocked(
+        matched: BufferedGroup,
+        raw: RawNotification,
+        clue: ParsedClue,
+        key: Pair<String, String>,
+        event: Pair<Long, Pair<String, String>>
+    ) {
+        matched.clues.add(clue)
+        if (clue.roughDirection == "REFUND") {
+            matched.roughDirection = "REFUND"
+        } else if (matched.roughDirection == "UNKNOWN" && clue.roughDirection != "UNKNOWN") {
+            matched.roughDirection = clue.roughDirection
+        }
+        store.addLog(
+            "DEDUP_MERGE",
+            "防重合并命中！将【${raw.appName}/${raw.sourceType}】合入已有同笔缓冲（共 ${matched.clues.size} 条，${MoneyMath.formatUnsignedMinor(matched.amountMinor ?: 0L, matched.currency, matched.scale)}）"
+        )
+        store.enqueueOffline(OfflineQueueItem(matched.groupId, nowProvider(), buildMergedPayload(matched)))
+        delivered[key] = event
+        if (delivered.size > 256) delivered.remove(delivered.keys.first())
+    }
+
+    private fun matchesPlatformAcquirer(appPackage: String, text: String): Boolean {
+        return when (appPackage) {
+            ScreenBillParser.PKG_WECHAT -> text.contains("财付通") || text.contains("微信")
+            ScreenBillParser.PKG_ALIPAY -> text.contains("支付宝")
+            else -> false
+        }
+    }
+
+    private fun isGenericMerchantName(merchant: String): Boolean {
+        return merchant.isBlank() ||
+            merchant == "未知商户" ||
+            merchant in AiClient.GENERIC_GATEWAY_MERCHANTS ||
+            merchant in setOf("微信收款", "支付宝收款")
+    }
+
+    private fun enqueueIntoBufferLocked(raw: RawNotification, clue: ParsedClue) {
+        val key = raw.appPackage to raw.notificationId
+        val event = raw.timestampMs to (raw.title to raw.content)
+        if (delivered[key] == event) return
+        if (tryMergeIntoExistingBufferLocked(raw, clue)) return
+
+        val gid = UUID.randomUUID().toString()
+        val baseExpiry = max(raw.timestampMs, nowProvider())
+        val group = BufferedGroup(
+            groupId = gid,
+            createdAtMs = raw.timestampMs,
+            expiresAtMs = baseExpiry + dedupWindowMs,
+            amountMinor = clue.amountMinor,
+            currency = clue.currency,
+            scale = clue.scale,
+            roughDirection = clue.roughDirection,
+            clues = mutableListOf(clue)
+        )
+        buffers[gid] = group
+        store.enqueueOffline(OfflineQueueItem(group.groupId, nowProvider(), buildMergedPayload(group)))
+        delivered[key] = event
+        if (delivered.size > 256) delivered.remove(delivered.keys.first())
+    }
+
+    private fun tryBackfillCommittedLocked(
+        capture: ScreenBillCapture,
+        raw: RawNotification,
+        clue: ParsedClue
+    ): BackfillResult {
+        val extId = capture.externalId
+        if (!extId.isNullOrBlank() && store.hasActiveSourceExternalId(extId)) {
+            return BackfillResult.ALREADY_EXISTS
+        }
+
+        // BILL_DETAIL requires a reliable page transaction timestamp; never backfill by browse time!
+        val refTime: Long
+        val windowMs: Long
+        if (capture.pageKind == ScreenPageKind.BILL_DETAIL) {
+            val pageTime = capture.eventTimeMs
+            if (pageTime == null) {
+                store.addLog(
+                    "SCREEN_SKIP",
+                    "账单详情页(${capture.appName} ${MoneyMath.formatUnsignedMinor(capture.amountMinor, capture.currency, capture.scale)})缺少可信交易时间，已跳过自动回填"
+                )
+                return BackfillResult.NO_MATCH
+            }
+            refTime = pageTime
+            windowMs = 300_000L
+        } else {
+            refTime = capture.eventTimeMs ?: capture.observedAtMs
+            windowMs = 90_000L
+        }
+
+        val sanitizedMerchant = PrivacySanitizer.sanitize(capture.merchant, profile).first.trim()
+        val hasConcreteScreenMerchant = sanitizedMerchant.length >= 2 &&
+            sanitizedMerchant != "未知商户" &&
+            sanitizedMerchant !in AiClient.GENERIC_GATEWAY_MERCHANTS
+
+        val rawCandidates = store.findBackfillCandidates(
+            amountMinor = capture.amountMinor,
+            currency = capture.currency,
+            sinceMs = refTime - windowMs,
+            untilMs = refTime + windowMs
+        )
+        val candidates = rawCandidates.filter { tx ->
+            val dirMatches = when (capture.directionHint) {
+                "OUT" -> tx.direction == TxDirection.EXPENSE
+                "IN" -> tx.direction == TxDirection.INCOME || tx.direction == TxDirection.REIMBURSEMENT_OFFSET
+                "REFUND" -> tx.direction == TxDirection.REFUND
+                else -> false
+            }
+            if (!dirMatches) return@filter false
+
+            val existingSources = store.listSourcesForTransaction(tx.id)
+            // Strict channel match: must belong to same platform or explicitly match its acquirer tag
+            val acquirerMatches = when (capture.appPackage) {
+                ScreenBillParser.PKG_WECHAT -> tx.sanitizedText.contains("财付通") || tx.sanitizedText.contains("微信")
+                ScreenBillParser.PKG_ALIPAY -> tx.sanitizedText.contains("支付宝")
+                else -> false
+            }
+            val channelMatches = capture.appName in tx.sourceChannels ||
+                tx.paymentMethod.contains(capture.appName) ||
+                existingSources.any { it.first.appPackage == capture.appPackage } ||
+                (tx.merchant == "未知商户" && acquirerMatches)
+            if (!channelMatches) return@filter false
+
+            // Never merge into a transaction that already holds a DIFFERENT genuine platform order ID
+            if (!extId.isNullOrBlank()) {
+                val conflictingOrder = existingSources.any { (src, _) ->
+                    !src.externalId.isNullOrBlank() && src.externalId != extId
+                }
+                if (conflictingOrder) return@filter false
+            }
+
+            val existingMerchantGeneric = tx.merchant == "未知商户" ||
+                tx.merchant in AiClient.GENERIC_GATEWAY_MERCHANTS ||
+                tx.merchant in setOf("微信收款", "支付宝收款")
+            val merchantCompatible = existingMerchantGeneric ||
+                !hasConcreteScreenMerchant ||
+                tx.merchant.contains(sanitizedMerchant) ||
+                sanitizedMerchant.contains(tx.merchant)
+            if (!merchantCompatible) return@filter false
+
+            if (capture.pageKind != ScreenPageKind.BILL_DETAIL &&
+                existingSources.any { it.first.sourceType == ScreenBillParser.SOURCE_TYPE_ACCESSIBILITY }
+            ) {
+                return@filter false
+            }
+            if (capture.pageKind == ScreenPageKind.BILL_DETAIL &&
+                !existingMerchantGeneric &&
+                existingSources.any { it.first.sourceType == ScreenBillParser.SOURCE_TYPE_ACCESSIBILITY }
+            ) {
+                return@filter false
+            }
+            true
+        }
+
+        if (candidates.size > 1) {
+            store.addLog(
+                "SCREEN_SKIP",
+                "时间窗内存在 ${candidates.size} 笔同额候选，为防错配跳过自动回填"
+            )
+            return BackfillResult.AMBIGUOUS
+        }
+        if (candidates.isEmpty()) return BackfillResult.NO_MATCH
+
+        val target = candidates.single()
+        val updated = store.runInTransaction {
+            val existing = store.getTransaction(target.id) ?: return@runInTransaction null
+            val existingPaired = store.listSourcesForTransaction(existing.id)
+            val existingLinks = existingPaired.map { it.second }
+            val now = nowProvider()
+
+            val existingMerchantGeneric = existing.merchant == "未知商户" ||
+                existing.merchant in AiClient.GENERIC_GATEWAY_MERCHANTS ||
+                existing.merchant in setOf("微信收款", "支付宝收款")
+            val shouldUpgradeMerchant = hasConcreteScreenMerchant && existingMerchantGeneric
+            val finalMerchant = if (shouldUpgradeMerchant) sanitizedMerchant else existing.merchant
+
+            val sanitizedLocalItem = capture.itemDescription
+                .takeIf { it.length >= 2 }
+                ?.let { PrivacySanitizer.sanitize(it, profile).first.trim() }
+                ?.takeIf { it.length >= 2 }
+
+            val genericCategories = setOf("日用", "副业/其他收入", "人情转账")
+            val finalCategory = if (shouldUpgradeMerchant && existing.category in genericCategories) {
+                AiClient.inferCategory("${capture.structuredNoteTag} ${sanitizedLocalItem.orEmpty()} $finalMerchant", finalMerchant, existing.direction)
+            } else {
+                existing.category
+            }
+
+            val finalSummary = if (shouldUpgradeMerchant && existing.itemSummary.startsWith("未知商户")) {
+                sanitizedLocalItem ?: "$finalMerchant 交易"
+            } else {
+                existing.itemSummary
+            }
+
+            val updatedChannels = (existing.sourceChannels + capture.appName).distinct()
+            val noteSuffix = if (shouldUpgradeMerchant) {
+                " [屏幕回填商户:$finalMerchant]"
+            } else {
+                " [已关联${capture.appName}屏幕证据]"
+            }
+
+            val newTx = existing.copy(
+                merchant = finalMerchant,
+                category = finalCategory,
+                itemSummary = finalSummary,
+                sourceChannels = updatedChannels,
+                mergedNotifications = existing.mergedNotifications + 1,
+                updatedAtMs = now,
+                revision = existing.revision + 1,
+                aiReasoning = existing.aiReasoning + noteSuffix
+            )
+
+            val screenSrc = clue.sourceRecord.copy(
+                merchantHint = if (hasConcreteScreenMerchant) sanitizedMerchant else clue.sourceRecord.merchantHint
+            )
+            val link = TransactionSourceLink(
+                transactionId = newTx.id,
+                sourceId = screenSrc.id,
+                linkRole = SourceLinkRole.CORROBORATING_CHANNEL,
+                candidateId = clue.primaryCandidateId
+            )
+
+            val change = TransactionChange(
+                opType = ChangeOpType.MERGE,
+                affectedTxIds = listOf(existing.id),
+                beforeRevisions = mapOf(existing.id to existing.revision),
+                afterRevisions = mapOf(existing.id to newTx.revision),
+                inversePayloadJson = JSONObject().apply {
+                    put("transactions", JSONArray().put(BackupCodec.txToJson(existing)))
+                    put("restoreLinksTxIds", JSONArray().put(existing.id))
+                    put("restoreLinks", JSONArray().apply {
+                        for (l in existingLinks) {
+                            put(JSONObject().apply {
+                                put("transactionId", l.transactionId)
+                                put("sourceId", l.sourceId)
+                                put("linkRole", l.linkRole.name)
+                                put("candidateId", l.candidateId ?: JSONObject.NULL)
+                            })
+                        }
+                    })
+                }.toString(),
+                createdAtMs = now
+            )
+
+            store.saveTransactionBundle(
+                transactions = listOf(newTx),
+                sources = listOf(screenSrc),
+                links = listOf(link),
+                change = change
+            )
+            newTx
+        }
+
+        return if (updated != null) {
+            store.addLog(
+                "SCREEN_BACKFILL",
+                "屏幕增强已合并到既有账单(${updated.id.take(8)})：${updated.merchant} ${MoneyMath.formatUnsignedMinor(updated.amountMinor, updated.currency, updated.scale)} (${updated.category})"
+            )
+            BackfillResult.BACKFILLED
+        } else {
+            BackfillResult.NO_MATCH
+        }
     }
 
     private fun ingestSingle(notif: RawNotification) {
@@ -147,55 +672,35 @@ class LedgerEngine(
         )
 
         if (clue.isZeroAuth) {
-            val group = BufferedGroup(
-                groupId = UUID.randomUUID().toString(),
-                createdAtMs = notif.timestampMs,
-                expiresAtMs = notif.timestampMs,
-                amountMinor = clue.amountMinor,
-                currency = clue.currency,
-                scale = clue.scale,
-                roughDirection = "ZERO_AUTH",
-                clues = mutableListOf(clue)
-            )
-            processGroup(group)
+            synchronized(finalizeLock) {
+                synchronized(bufferLock) {
+                    if (restoring) {
+                        deferredDuringRestore.add(DeferredEvent.Notif(notif))
+                        return
+                    }
+                }
+                val group = BufferedGroup(
+                    groupId = UUID.randomUUID().toString(),
+                    createdAtMs = notif.timestampMs,
+                    expiresAtMs = notif.timestampMs,
+                    amountMinor = clue.amountMinor,
+                    currency = clue.currency,
+                    scale = clue.scale,
+                    roughDirection = "ZERO_AUTH",
+                    clues = mutableListOf(clue)
+                )
+                processGroup(group)
+            }
             notifyChanged()
             return
         }
 
         synchronized(bufferLock) {
-            val key = notif.appPackage to notif.notificationId
-            val event = notif.timestampMs to (notif.title to notif.content)
-            if (delivered[key] == event) return
-            val matched = findMatchingBuffer(clue, notif.timestampMs)
-            if (matched != null) {
-                matched.clues.add(clue)
-                if (clue.roughDirection == "REFUND") {
-                    matched.roughDirection = "REFUND"
-                } else if (matched.roughDirection == "UNKNOWN" && clue.roughDirection != "UNKNOWN") {
-                    matched.roughDirection = clue.roughDirection
-                }
-                store.addLog(
-                    "DEDUP_MERGE",
-                    "防重合并命中！将【${notif.appName}】合入已有同笔缓冲（共 ${matched.clues.size} 条，${MoneyMath.formatUnsignedMinor(matched.amountMinor ?: 0L, matched.currency, matched.scale)}）"
-                )
-            } else {
-                val gid = UUID.randomUUID().toString()
-                val baseExpiry = max(notif.timestampMs, nowProvider())
-                buffers[gid] = BufferedGroup(
-                    groupId = gid,
-                    createdAtMs = notif.timestampMs,
-                    expiresAtMs = baseExpiry + dedupWindowMs,
-                    amountMinor = clue.amountMinor,
-                    currency = clue.currency,
-                    scale = clue.scale,
-                    roughDirection = clue.roughDirection,
-                    clues = mutableListOf(clue)
-                )
+            if (restoring) {
+                deferredDuringRestore.add(DeferredEvent.Notif(notif))
+                return
             }
-            val group = matched ?: buffers.values.last()
-            store.enqueueOffline(OfflineQueueItem(group.groupId, nowProvider(), buildMergedPayload(group)))
-            delivered[key] = event
-            if (delivered.size > 256) delivered.remove(delivered.keys.first())
+            enqueueIntoBufferLocked(notif, clue)
         }
         notifyChanged()
     }
@@ -568,10 +1073,19 @@ class LedgerEngine(
                 }
             }
 
-            // Restore links if present
+            // Restore links if present (explicitly handles empty link sets too!)
             val linkArr = inv.optJSONArray("restoreLinks")
             if (linkArr != null) {
                 val groupedByTx = mutableMapOf<String, MutableList<TransactionSourceLink>>()
+                val txIdsToReset = LinkedHashSet<String>()
+                val clearIdsArr = inv.optJSONArray("restoreLinksTxIds")
+                if (clearIdsArr != null) {
+                    for (i in 0 until clearIdsArr.length()) {
+                        txIdsToReset.add(clearIdsArr.getString(i))
+                    }
+                } else {
+                    txIdsToReset.addAll(change.affectedTxIds)
+                }
                 for (i in 0 until linkArr.length()) {
                     val lo = linkArr.getJSONObject(i)
                     val link = TransactionSourceLink(
@@ -580,11 +1094,13 @@ class LedgerEngine(
                         linkRole = SourceLinkRole.valueOf(lo.getString("linkRole")),
                         candidateId = if (lo.isNull("candidateId")) null else lo.optString("candidateId").ifBlank { null }
                     )
+                    txIdsToReset.add(link.transactionId)
                     groupedByTx.getOrPut(link.transactionId) { mutableListOf() }.add(link)
                 }
-                for ((tid, links) in groupedByTx) {
+                for (tid in txIdsToReset) {
                     store.deleteLinksForTransaction(tid)
-                    store.saveLinks(links)
+                    val toSave = groupedByTx[tid].orEmpty()
+                    if (toSave.isNotEmpty()) store.saveLinks(toSave)
                 }
             }
 
@@ -629,6 +1145,7 @@ class LedgerEngine(
             val cashInflowMinor = incomeMinor + refundMinor + offsetMinor
             val netBalMinor = incomeMinor - netPersonalMinor
             val allCurr = all.filter { it.currency == curr }
+            val currIgnored = allCurr.filter { it.status == TxStatus.IGNORED }
             byCurrency[curr] = CurrencyTotals(
                 currency = curr,
                 scale = scale,
@@ -641,11 +1158,15 @@ class LedgerEngine(
                 netBalanceMinor = netBalMinor,
                 recordedCount = allCurr.count { it.status == TxStatus.RECORDED || it.status == TxStatus.NEEDS_REVIEW },
                 needsReviewCount = allCurr.count { it.status == TxStatus.NEEDS_REVIEW },
-                ignoredCount = allCurr.count { it.status == TxStatus.IGNORED }
+                ignoredCount = currIgnored.size,
+                internalTransferCount = currIgnored.count { it.direction == TxDirection.INTERNAL_TRANSFER },
+                otherIgnoredCount = currIgnored.count { it.direction != TxDirection.INTERNAL_TRANSFER }
             )
         }
 
         val cny = byCurrency["CNY"]!!
+        val internalTotal = ignored.count { it.direction == TxDirection.INTERNAL_TRANSFER }
+        val otherIgnoredTotal = ignored.count { it.direction != TxDirection.INTERNAL_TRANSFER }
         return LedgerSummary(
             grossExpense = MoneyMath.minorToDouble(cny.grossExpenseMinor, 2),
             totalRefund = MoneyMath.minorToDouble(cny.totalRefundMinor, 2),
@@ -656,6 +1177,8 @@ class LedgerEngine(
             recordedCount = active.size,
             needsReviewCount = needsReviewTotal,
             ignoredCount = ignored.size,
+            internalTransferCount = internalTotal,
+            otherIgnoredCount = otherIgnoredTotal,
             offlineQueueCount = synchronized(bufferLock) { store.listOfflineQueue().count { it.queueId !in buffers } },
             dbSizeBytes = store.getDbSizeBytes(),
             byCurrency = byCurrency
@@ -1093,6 +1616,22 @@ class LedgerEngine(
         val splitCands = richClue.splitPartIds.mapNotNull { candMap[it] }
         val settlementCand = richClue.settlementCandidateId?.let { candMap[it] }
 
+        val merchantOverride = sorted.firstNotNullOfOrNull { c ->
+            c.raw.merchantOverride
+                ?.trim()
+                ?.takeIf { it.length >= 2 && it != "未知商户" }
+                ?.let { PrivacySanitizer.sanitize(it, profile).first.trim() }
+                ?.takeIf { it.length >= 2 && it != "未知商户" }
+        }
+
+        val localItemHint = sorted.firstNotNullOfOrNull { c ->
+            c.raw.localItemHint
+                ?.trim()
+                ?.takeIf { it.length >= 2 }
+                ?.let { PrivacySanitizer.sanitize(it, profile).first.trim() }
+                ?.takeIf { it.length >= 2 }
+        }
+
         return MergedPayload(
             groupId = group.groupId,
             createdAtMs = group.createdAtMs,
@@ -1116,7 +1655,9 @@ class LedgerEngine(
             isZeroAuth = sorted.any { it.isZeroAuth },
             deepLink = deepLink,
             deepLinkLabel = deepLinkLabel,
-            sources = sorted.map { it.sourceRecord }
+            sources = sorted.map { it.sourceRecord },
+            merchantHintOverride = merchantOverride,
+            localItemHint = localItemHint
         )
     }
 
@@ -1203,7 +1744,8 @@ class LedgerEngine(
         }
 
         val merchantHint = notificationMerchant(notif)
-        val fp = shortFingerprint(notif.appPackage, notif.sourceType, primaryCand?.amountMinor, primaryCand?.currency ?: "CNY", merchantHint, notif.timestampMs / 60_000L)
+        val fp = notif.dedupFingerprintOverride?.takeIf { it.isNotBlank() }
+            ?: shortFingerprint(notif.appPackage, notif.sourceType, primaryCand?.amountMinor, primaryCand?.currency ?: "CNY", merchantHint, notif.timestampMs / 60_000L)
         val sourceRecord = TransactionSource(
             id = UUID.randomUUID().toString(),
             sourceType = notif.sourceType,
@@ -1230,7 +1772,7 @@ class LedgerEngine(
             feeCandidateId = extraction.feeCandidate?.candidateId,
             splitPartIds = extraction.splitParts.map { it.candidateId },
             settlementCandidateId = extraction.settlementCandidate?.candidateId,
-            ambiguityReason = extraction.ambiguityReason,
+            ambiguityReason = extraction.ambiguityReason ?: notif.ambiguityOverride,
             roughDirection = roughDir,
             priority = priority,
             cardTail = cardTail,
@@ -1254,6 +1796,8 @@ class LedgerEngine(
     }
 
     private fun notificationMerchant(raw: RawNotification): String {
+        val override = raw.merchantOverride?.trim()
+        if (!override.isNullOrBlank() && override != "未知商户") return override
         val merchant = AiClient.extractMerchant(raw.content)
         if (merchant != "未知商户") return merchant
         val title = raw.title.trim()
@@ -1286,11 +1830,27 @@ class LedgerEngine(
             }
 
             if (gAmt == amountMinor) {
+                if (!clue.raw.externalId.isNullOrBlank() &&
+                    group.clues.any { !it.raw.externalId.isNullOrBlank() && it.raw.externalId != clue.raw.externalId }
+                ) {
+                    continue
+                }
+                if (clue.raw.appPackage == ScreenBillParser.PKG_WECHAT &&
+                    group.clues.any { it.raw.appPackage == ScreenBillParser.PKG_ALIPAY }
+                ) {
+                    continue
+                }
+                if (clue.raw.appPackage == ScreenBillParser.PKG_ALIPAY &&
+                    group.clues.any { it.raw.appPackage == ScreenBillParser.PKG_WECHAT }
+                ) {
+                    continue
+                }
                 if (group.clues.any { it.cardTail != null && clue.cardTail != null && it.cardTail != clue.cardTail }) continue
                 val merchant = notificationMerchant(clue.raw)
                 if (group.clues.any { prior ->
                     val other = notificationMerchant(prior.raw)
-                    merchant != "未知商户" && other != "未知商户" && !merchant.contains(other) && !other.contains(merchant)
+                    !isGenericMerchantName(merchant) && !isGenericMerchantName(other) &&
+                        !merchant.contains(other) && !other.contains(merchant)
                 }) continue
                 val existingApps = group.clues.map { it.raw.appPackage }.toSet()
                 val existingSources = group.clues.map { it.raw.appPackage to it.raw.sourceType }.toSet()
@@ -1332,7 +1892,8 @@ class LedgerEngine(
 
         private val NOISE_BLACKLIST_KEYWORDS = listOf(
             "验证码", "动态密码", "校验码", "短信验证", "安全验证",
-            "优惠券", "代金券", "神券", "消费券", "立减券", "满减", "领券",
+            "优惠券", "代金券", "神券", "消费券", "立减券", "立减金", "满减", "领券",
+            "申领指南", "补贴申领", "达标可领", "预提取", "活动规则", "待领取", "可领取", "免费领",
             "红包雨", "抽奖", "立省", "降价", "预售", "秒杀", "点击领取", "立即领取", "去使用", "助力",
             "账单已出", "本期应还", "应还金额", "最低还款", "还款提醒", "待还款", "最后还款日"
         )
@@ -1360,7 +1921,7 @@ class LedgerEngine(
 
         private val DEEP_LINKS = mapOf(
             "com.eg.android.AlipayGphone" to ("alipays://platformapi/startapp?appId=20000003" to "打开支付宝账单"),
-            "com.tencent.mm" to ("weixin://dl/wallet" to "打开微信账单"),
+            "com.tencent.mm" to ("walletwatcher://launch/com.tencent.mm" to "打开微信查账单"),
             "com.unionpay" to ("upwallet://" to "打开云闪付"),
             "com.sankuai.meituan" to ("imeituan://www.meituan.com/order/list" to "打开美团订单"),
             "com.taobao.taobao" to ("taobao://m.taobao.com/awp/base/orderlist.htm" to "打开淘宝订单"),

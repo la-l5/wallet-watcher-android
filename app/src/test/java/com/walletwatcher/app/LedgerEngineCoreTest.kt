@@ -15,6 +15,7 @@ class LedgerEngineCoreTest {
         ),
         private var aiConfig: AiConfig = AiConfig(mode = AiConfig.MODE_LOCAL)
     ) : LedgerStore {
+        private val storeLock = Any()
         private val txs = LinkedHashMap<String, Transaction>()
         private val sources = LinkedHashMap<String, TransactionSource>()
         private val links = mutableListOf<TransactionSourceLink>()
@@ -23,14 +24,14 @@ class LedgerEngineCoreTest {
         private val queue = LinkedHashMap<String, OfflineQueueItem>()
         private val logs = mutableListOf<AuditLogEntry>()
 
-        override fun saveTransaction(tx: Transaction) { txs[tx.id] = tx }
+        override fun saveTransaction(tx: Transaction) = synchronized(storeLock) { txs[tx.id] = tx }
 
         override fun saveTransactionBundle(
             transactions: List<Transaction>,
             sources: List<TransactionSource>,
             links: List<TransactionSourceLink>,
             change: TransactionChange?
-        ) {
+        ) = synchronized(storeLock) {
             for (s in sources) this.sources[s.id] = s
             for (t in transactions) this.txs[t.id] = t
             for (l in links) {
@@ -40,35 +41,72 @@ class LedgerEngineCoreTest {
             if (change != null) changes[change.opId] = change
         }
 
-        override fun getTransaction(txId: String): Transaction? = txs[txId]
+        override fun getTransaction(txId: String): Transaction? = synchronized(storeLock) { txs[txId] }
 
-        override fun listTransactions(limit: Int): List<Transaction> =
+        override fun listTransactions(limit: Int): List<Transaction> = synchronized(storeLock) {
             txs.values.sortedByDescending { it.occurredAtMs }.take(limit)
+        }
 
-        override fun listSourcesForTransaction(txId: String): List<Pair<TransactionSource, TransactionSourceLink>> =
+        override fun listSourcesForTransaction(txId: String): List<Pair<TransactionSource, TransactionSourceLink>> = synchronized(storeLock) {
             links.filter { it.transactionId == txId }.mapNotNull { l ->
                 sources[l.sourceId]?.let { it to l }
             }
+        }
 
-        override fun listLinksForSource(sourceId: String): List<TransactionSourceLink> =
+        override fun listLinksForSource(sourceId: String): List<TransactionSourceLink> = synchronized(storeLock) {
             links.filter { it.sourceId == sourceId }
+        }
 
-        override fun listAllSources(): List<TransactionSource> = sources.values.toList()
-        override fun listAllLinks(): List<TransactionSourceLink> = links.toList()
-        override fun listChanges(limit: Int): List<TransactionChange> = changes.values.reversed().take(limit)
-        override fun getChange(opId: String): TransactionChange? = changes[opId]
-        override fun saveChange(change: TransactionChange) { changes[change.opId] = change }
-        override fun deleteLinksForTransaction(txId: String) { links.removeAll { it.transactionId == txId } }
-        override fun saveLinks(links: List<TransactionSourceLink>) {
+        override fun hasActiveSourceExternalId(externalId: String): Boolean = synchronized(storeLock) {
+            if (externalId.isBlank()) return@synchronized false
+            val matchingSourceIds = sources.values.filter { it.externalId == externalId }.map { it.id }.toSet()
+            if (matchingSourceIds.isEmpty()) return@synchronized false
+            links.any { l ->
+                l.sourceId in matchingSourceIds && txs[l.transactionId]?.status != TxStatus.REVERTED
+            }
+        }
+
+        override fun hasActiveSourceFingerprint(shortFingerprint: String): Boolean = synchronized(storeLock) {
+            if (shortFingerprint.isBlank()) return@synchronized false
+            val matchingSourceIds = sources.values.filter { it.shortFingerprint == shortFingerprint }.map { it.id }.toSet()
+            if (matchingSourceIds.isEmpty()) return@synchronized false
+            links.any { l ->
+                l.sourceId in matchingSourceIds && txs[l.transactionId]?.status != TxStatus.REVERTED
+            }
+        }
+
+        override fun findBackfillCandidates(
+            amountMinor: Long,
+            currency: String,
+            sinceMs: Long,
+            untilMs: Long
+        ): List<Transaction> = synchronized(storeLock) {
+            txs.values
+                .filter {
+                    (it.status == TxStatus.RECORDED || it.status == TxStatus.NEEDS_REVIEW) &&
+                        it.currency == currency &&
+                        it.amountMinor == amountMinor &&
+                        it.occurredAtMs in sinceMs..untilMs
+                }
+                .sortedByDescending { it.occurredAtMs }
+        }
+
+        override fun listAllSources(): List<TransactionSource> = synchronized(storeLock) { sources.values.toList() }
+        override fun listAllLinks(): List<TransactionSourceLink> = synchronized(storeLock) { links.toList() }
+        override fun listChanges(limit: Int): List<TransactionChange> = synchronized(storeLock) { changes.values.reversed().take(limit) }
+        override fun getChange(opId: String): TransactionChange? = synchronized(storeLock) { changes[opId] }
+        override fun saveChange(change: TransactionChange) = synchronized(storeLock) { changes[change.opId] = change }
+        override fun deleteLinksForTransaction(txId: String) = synchronized(storeLock) { links.removeAll { it.transactionId == txId }; Unit }
+        override fun saveLinks(links: List<TransactionSourceLink>) = synchronized(storeLock) {
             for (l in links) {
                 this.links.removeAll { it.transactionId == l.transactionId && it.sourceId == l.sourceId && it.linkRole == l.linkRole }
                 this.links.add(l)
             }
         }
 
-        override fun listUserRules(): List<UserMerchantRule> = rules.values.toList()
-        override fun saveUserRule(rule: UserMerchantRule) { rules[rule.id] = rule }
-        override fun deleteUserRule(ruleId: String) { rules.remove(ruleId) }
+        override fun listUserRules(): List<UserMerchantRule> = synchronized(storeLock) { rules.values.toList() }
+        override fun saveUserRule(rule: UserMerchantRule) = synchronized(storeLock) { rules[rule.id] = rule }
+        override fun deleteUserRule(ruleId: String) = synchronized(storeLock) { rules.remove(ruleId); Unit }
 
         override fun findRecentMirrorCandidates(
             amountMinor: Long,
@@ -76,7 +114,7 @@ class LedgerEngineCoreTest {
             oppositeDirection: TxDirection,
             sinceMs: Long,
             untilMs: Long
-        ): List<Transaction> =
+        ): List<Transaction> = synchronized(storeLock) {
             txs.values.filter {
                 it.status == TxStatus.RECORDED &&
                     it.direction == oppositeDirection &&
@@ -84,13 +122,14 @@ class LedgerEngineCoreTest {
                     it.amountMinor == amountMinor &&
                     it.occurredAtMs in sinceMs..untilMs
             }
+        }
 
         override fun findRecentExpenseForRefund(
             amountMinor: Long,
             currency: String,
             merchant: String,
             sinceMs: Long
-        ): Transaction? =
+        ): Transaction? = synchronized(storeLock) {
             txs.values
                 .filter {
                     it.status == TxStatus.RECORDED &&
@@ -100,13 +139,14 @@ class LedgerEngineCoreTest {
                         it.occurredAtMs >= sinceMs
                 }
                 .maxByOrNull { it.occurredAtMs }
+        }
 
         override fun findRecentSplitFundedCandidate(
             partAmountMinor: Long,
             currency: String,
             sinceMs: Long,
             untilMs: Long
-        ): Pair<Transaction, TransactionSource>? {
+        ): Pair<Transaction, TransactionSource>? = synchronized(storeLock) {
             val candidates = txs.values.filter {
                 (it.status == TxStatus.RECORDED || it.status == TxStatus.NEEDS_REVIEW) &&
                     it.direction == TxDirection.EXPENSE &&
@@ -125,29 +165,30 @@ class LedgerEngineCoreTest {
                             c.amountMinor == partAmountMinor &&
                             c.candidateId !in usedIds
                     }
-                    if (found != null) return tx to src
+                    if (found != null) return@synchronized tx to src
                 }
             }
-            return null
+            null
         }
 
-        override fun enqueueOffline(item: OfflineQueueItem) { queue[item.queueId] = item }
-        override fun listOfflineQueue(): List<OfflineQueueItem> = queue.values.sortedBy { it.enqueuedAtMs }
-        override fun removeOfflineItem(queueId: String) { queue.remove(queueId) }
-        override fun addLog(stage: String, message: String, sanitizedSample: String) {
+        override fun enqueueOffline(item: OfflineQueueItem) = synchronized(storeLock) { queue[item.queueId] = item }
+        override fun listOfflineQueue(): List<OfflineQueueItem> = synchronized(storeLock) { queue.values.sortedBy { it.enqueuedAtMs } }
+        override fun removeOfflineItem(queueId: String) = synchronized(storeLock) { queue.remove(queueId); Unit }
+        override fun addLog(stage: String, message: String, sanitizedSample: String) = synchronized(storeLock) {
             logs.add(AuditLogEntry(logs.size.toLong() + 1L, System.currentTimeMillis(), stage, message, sanitizedSample))
+            Unit
         }
-        override fun listLogs(limit: Int): List<AuditLogEntry> = logs.reversed().take(limit)
-        override fun loadProfile(): UserProfile = profile
-        override fun saveProfile(profile: UserProfile) { this.profile = profile }
-        override fun loadAiConfig(): AiConfig = aiConfig
-        override fun saveAiConfig(config: AiConfig) { this.aiConfig = config }
+        override fun listLogs(limit: Int): List<AuditLogEntry> = synchronized(storeLock) { logs.reversed().take(limit) }
+        override fun loadProfile(): UserProfile = synchronized(storeLock) { profile }
+        override fun saveProfile(profile: UserProfile) = synchronized(storeLock) { this.profile = profile }
+        override fun loadAiConfig(): AiConfig = synchronized(storeLock) { aiConfig }
+        override fun saveAiConfig(config: AiConfig) = synchronized(storeLock) { this.aiConfig = config }
         override fun getDbSizeBytes(): Long = 4096L
-        override fun clearLedgerAndLogs() {
+        override fun clearLedgerAndLogs() = synchronized(storeLock) {
             txs.clear(); sources.clear(); links.clear(); changes.clear(); queue.clear(); logs.clear()
         }
 
-        override fun <T> runInTransaction(block: () -> T): T = block()
+        override fun <T> runInTransaction(block: () -> T): T = synchronized(storeLock) { block() }
 
         override fun exportLogicalSnapshot(nowMs: Long): BackupSnapshot {
             val txList = txs.values.toList()
@@ -883,5 +924,697 @@ class LedgerEngineCoreTest {
         assertThrows(BackupException::class.java) {
             BackupCodec.decryptSnapshot(tamperedHeader, "pass1234".toCharArray())
         }
+    }
+
+    // ==================== Step 3: Real-Device Fixes & Read-Only Screen Capture ====================
+
+    @Test
+    fun realDevicePromoAdsBlockedWhileRealPaymentWithDiscountVoucherStillBooks() {
+        val store = InMemoryLedgerStore()
+        val engine = LedgerEngine(store)
+        val t0 = 1_700_000_000_000L
+
+        // Real-device observed marketing notifications that must be blocked in offline mode
+        val ads = listOf(
+            "微信支付" to "微信立减金申领指南：本月消费达标可领10元立减金",
+            "招商银行" to "补贴申领提醒：您有50元消费立减金可预提取，点击查看活动规则",
+            "支付宝" to "达标可领20元立减金，限今日预提取",
+            "云闪付" to "消费补贴申领通道开启，最高立减30元，详见活动规则",
+            "微信支付" to "您有一笔5元立减金待领取，快去使用吧"
+        )
+        ads.forEachIndexed { idx, (title, content) ->
+            engine.ingestNotification(
+                RawNotification("com.tencent.mm", "微信", title, content, t0 + idx * 1000L, notificationId = "ad-$idx")
+            )
+        }
+        engine.flushExpired(true)
+        assertEquals(0, store.listTransactions().size)
+
+        // Real payment that ALSO mentions 立减金优惠 must still book the real paid amount!
+        engine.ingestNotification(
+            RawNotification(
+                "com.tencent.mm",
+                "微信",
+                "微信支付",
+                "微信支付凭证：向蜜雪冰城付款10.00元（已使用立减金优惠2.00元）",
+                t0 + 20_000L,
+                notificationId = "real-1"
+            )
+        )
+        engine.flushExpired(true)
+
+        val tx = store.listTransactions().single()
+        assertEquals(TxDirection.EXPENSE, tx.direction)
+        assertEquals(1000L, tx.amountMinor)
+        assertEquals("蜜雪冰城", tx.merchant)
+    }
+
+    @Test
+    fun summaryDistinguishesInternalTransfersFromOtherIgnoredAndWeChatDeepLinkAvoidsDeadUri() {
+        val store = InMemoryLedgerStore()
+        val engine = LedgerEngine(store)
+        val t0 = 1_700_000_000_000L
+
+        engine.ingestNotification(RawNotification("com.tencent.mm", "微信", "微信支付", "微信支付凭证：向瑞幸咖啡付款19.90元", t0))
+        engine.ingestNotification(RawNotification("cmb.pb", "招商银行", "银证转账", "尾号6288银行转证券向华泰证券转出5000.00元", t0 + 1000L))
+        engine.ingestNotification(RawNotification("com.tencent.mm", "微信", "微信支付分", "拼多多0元下单，已使用先用后付，确认收货后自动扣款39.90元", t0 + 2000L))
+        engine.flushExpired(true)
+
+        val summary = engine.getSummary(t0)
+        assertEquals(1, summary.recordedCount)
+        assertEquals(2, summary.ignoredCount)
+        assertEquals(1, summary.internalTransferCount)
+        assertEquals(1, summary.otherIgnoredCount)
+        assertEquals(1, summary.byCurrency["CNY"]!!.internalTransferCount)
+        assertEquals(1, summary.byCurrency["CNY"]!!.otherIgnoredCount)
+
+        val wxTx = store.listTransactions().first { it.direction == TxDirection.EXPENSE }
+        assertFalse("Dead weixin://dl/wallet must never be generated", wxTx.deepLink.startsWith("weixin://"))
+        assertEquals("walletwatcher://launch/com.tencent.mm", wxTx.deepLink)
+    }
+
+    @Test
+    fun screenCaptureMergesWithInBufferUnknownMerchantWeChatNotification() {
+        val store = InMemoryLedgerStore()
+        val engine = LedgerEngine(store)
+        val t0 = 1_700_000_000_000L
+
+        // 1. Real WeChat notification lacks merchant name ("已支付¥19.90")
+        engine.ingestNotification(
+            RawNotification("com.tencent.mm", "微信", "微信支付", "微信支付凭证：已支付¥19.90，付款方式：零钱", t0, notificationId = "wx-notif-1")
+        )
+        // 2. Read-only pay success screen arrives 2 seconds later with real merchant "7-11便利店(海岸城)"
+        val capture = ScreenBillParser.parse(
+            packageName = ScreenBillParser.PKG_WECHAT,
+            className = "com.tencent.mm.plugin.wallet_core.ui.WalletOrderInfoNewUI",
+            rawTexts = listOf("支付成功", "7-11便利店(海岸城)", "¥", "19.90", "付款方式", "零钱", "完成"),
+            observedAtMs = t0 + 2_000L
+        )!!
+        assertEquals(ScreenIngestOutcome.MERGED_INTO_BUFFER, engine.ingestScreenCapture(capture))
+        engine.flushExpired(true)
+
+        val txs = store.listTransactions()
+        assertEquals(1, txs.size)
+        val tx = txs.single()
+        assertEquals(1990L, tx.amountMinor)
+        assertEquals("7-11便利店(海岸城)", tx.merchant)
+        assertEquals("餐饮", tx.category)
+        assertEquals(2, tx.mergedNotifications)
+        val sources = store.listSourcesForTransaction(tx.id)
+        assertEquals(2, sources.size)
+        assertTrue(sources.any { it.first.sourceType == "notification" })
+        assertTrue(sources.any { it.first.sourceType == ScreenBillParser.SOURCE_TYPE_ACCESSIBILITY })
+    }
+
+    @Test
+    fun screenCaptureBackfillsAlreadyCommittedUnknownMerchantAndSupportsUndoAndRelink() {
+        val store = InMemoryLedgerStore()
+        val engine = LedgerEngine(store)
+        val zone = java.time.ZoneId.of("Asia/Shanghai")
+        val t0 = ScreenBillParser.parseDateTimeMs("2026-11-26 12:15:00", zone)!!
+
+        // Notification arrives and flushes immediately as "未知商户" (日用)
+        engine.ingestNotification(
+            RawNotification("com.tencent.mm", "微信", "微信支付", "微信支付凭证：已支付¥28.00", t0, notificationId = "wx-old-1")
+        )
+        engine.flushExpired(true)
+        val before = store.listTransactions().single()
+        assertEquals("未知商户", before.merchant)
+        assertEquals("日用", before.category)
+
+        // Two hours later, user opens WeChat Bill Detail page -> atomic in-place merchant backfill!
+        val detail = ScreenBillParser.parse(
+            packageName = ScreenBillParser.PKG_WECHAT,
+            className = "com.tencent.mm.plugin.mall.ui.MallTransactionDetailUI",
+            rawTexts = listOf(
+                "返回", "麦当劳餐厅", "-28.00",
+                "当前状态", "支付成功",
+                "商品", "板烧鸡腿堡套餐",
+                "支付时间", "2026年11月26日 12:15:10",
+                "支付方式", "零钱",
+                "交易单号", "42000024998877665544"
+            ),
+            observedAtMs = t0 + 7_200_000L,
+            zoneId = zone
+        )!!
+        assertEquals(ScreenIngestOutcome.BACKFILLED_COMMITTED, engine.ingestScreenCapture(detail))
+
+        val after = store.listTransactions().single()
+        assertEquals(before.id, after.id)
+        assertEquals("麦当劳餐厅", after.merchant)
+        assertEquals("餐饮", after.category)
+        assertEquals(2, after.mergedNotifications)
+        assertEquals(2, store.listSourcesForTransaction(after.id).size)
+
+        // Re-opening the same bill detail is idempotently ignored via active externalId
+        assertEquals(ScreenIngestOutcome.ALREADY_EXISTS, engine.ingestScreenCapture(detail))
+        assertEquals(1, store.listTransactions().size)
+
+        // Backfill change is cleanly undoable AND frees externalId for subsequent re-linking!
+        val mergeOp = store.listChanges().first { it.opType == ChangeOpType.MERGE }
+        assertTrue(engine.undoChange(mergeOp.opId))
+        val undone = store.getTransaction(before.id)!!
+        assertEquals("未知商户", undone.merchant)
+        assertEquals(1, store.listSourcesForTransaction(undone.id).size)
+        assertFalse(store.hasActiveSourceExternalId(detail.externalId!!))
+
+        // Re-linking the undone bill detail succeeds again cleanly
+        assertEquals(ScreenIngestOutcome.BACKFILLED_COMMITTED, engine.ingestScreenCapture(detail))
+        assertEquals("麦当劳餐厅", store.getTransaction(before.id)!!.merchant)
+    }
+
+    @Test
+    fun undoBackfillOnEmptyInitialLinksClearsAddedLinkCleanly() {
+        val store = InMemoryLedgerStore()
+        val engine = LedgerEngine(store)
+        val zone = java.time.ZoneId.of("Asia/Shanghai")
+        val t0 = ScreenBillParser.parseDateTimeMs("2026-11-26 14:00:00", zone)!!
+
+        // Legacy migrated tx with ZERO initial source links
+        val legacyTx = Transaction(
+            id = "legacy-zero-link",
+            occurredAtMs = t0,
+            observedAtMs = t0,
+            updatedAtMs = t0,
+            revision = 1,
+            direction = TxDirection.EXPENSE,
+            amountMinor = 2000L,
+            merchant = "未知商户",
+            itemSummary = "未知商户 交易",
+            category = "日用",
+            paymentMethod = "微信零钱",
+            sourceChannels = listOf("微信"),
+            mergedNotifications = 1,
+            status = TxStatus.RECORDED,
+            legacyMissingSources = true
+        )
+        store.saveTransaction(legacyTx)
+        assertEquals(0, store.listSourcesForTransaction(legacyTx.id).size)
+
+        val detail = ScreenBillParser.parse(
+            packageName = ScreenBillParser.PKG_WECHAT,
+            className = "MallTransactionDetailUI",
+            rawTexts = listOf(
+                "返回", "肯德基", "-20.00",
+                "当前状态", "支付成功",
+                "支付时间", "2026年11月26日 14:00:15",
+                "交易单号", "42000012345678901234"
+            ),
+            observedAtMs = t0 + 60_000L,
+            zoneId = zone
+        )!!
+        assertEquals(ScreenIngestOutcome.BACKFILLED_COMMITTED, engine.ingestScreenCapture(detail))
+        assertEquals(1, store.listSourcesForTransaction(legacyTx.id).size)
+
+        val mergeOp = store.listChanges().first { it.opType == ChangeOpType.MERGE }
+        assertTrue(engine.undoChange(mergeOp.opId))
+        // Empty restoreLinks MUST clear the newly added link rather than leaving it behind!
+        assertEquals(0, store.listSourcesForTransaction(legacyTx.id).size)
+        assertFalse(store.hasActiveSourceExternalId(detail.externalId!!))
+    }
+
+    @Test
+    fun billDetailWithoutTimeOrFromDifferentAppNeverBackfillsTodayTransaction() {
+        val store = InMemoryLedgerStore()
+        val engine = LedgerEngine(store)
+        val zone = java.time.ZoneId.of("Asia/Shanghai")
+        val t0 = ScreenBillParser.parseDateTimeMs("2026-11-26 15:00:00", zone)!!
+
+        // Today's ¥20.00 Alipay tx with unknown merchant
+        engine.ingestNotification(
+            RawNotification("com.eg.android.AlipayGphone", "支付宝", "付款成功", "付款成功¥20.00", t0, notificationId = "ali-1")
+        )
+        engine.flushExpired(true)
+        val aliTx = store.listTransactions().single()
+        assertEquals("未知商户", aliTx.merchant)
+
+        // 1. WeChat bill detail of ¥20.00 at the exact same minute MUST NOT cross-app match Alipay tx!
+        val wxDetailSameTime = ScreenBillParser.parse(
+            packageName = ScreenBillParser.PKG_WECHAT,
+            className = "MallTransactionDetailUI",
+            rawTexts = listOf(
+                "返回", "老乡鸡", "-20.00",
+                "当前状态", "支付成功",
+                "支付时间", "2026年11月26日 15:00:10",
+                "交易单号", "42000099990000111122"
+            ),
+            observedAtMs = t0 + 20_000L,
+            zoneId = zone
+        )!!
+        assertEquals(ScreenIngestOutcome.SKIPPED_NO_MATCH, engine.ingestScreenCapture(wxDetailSameTime))
+        assertEquals("未知商户", store.getTransaction(aliTx.id)!!.merchant)
+
+        // 2. Alipay bill detail WITHOUT any page timestamp MUST NOT backfill today's tx by browse time!
+        val aliDetailNoTime = ScreenBillParser.parse(
+            packageName = ScreenBillParser.PKG_ALIPAY,
+            className = "BillDetailActivity",
+            rawTexts = listOf(
+                "账单详情", "上月某店", "-20.00",
+                "交易状态", "交易成功",
+                "付款方式", "花呗"
+            ),
+            observedAtMs = t0 + 10_000L,
+            zoneId = zone
+        )!!
+        assertNull(aliDetailNoTime.eventTimeMs)
+        assertEquals(ScreenIngestOutcome.SKIPPED_NO_MATCH, engine.ingestScreenCapture(aliDetailNoTime))
+        assertEquals("未知商户", store.getTransaction(aliTx.id)!!.merchant)
+        assertEquals(1, store.listTransactions().size)
+    }
+
+    @Test
+    fun unnotifiedGroupChatReceiptBooksConsecutiveSameAmountAndHistoricalDetailDoesNotFabricate() {
+        val store = InMemoryLedgerStore()
+        val engine = LedgerEngine(store)
+        val zone = java.time.ZoneId.of("Asia/Shanghai")
+        val t0 = ScreenBillParser.parseDateTimeMs("2026-11-26 13:05:10", zone)!!
+
+        // 1. Two real group receipts of ¥3.30 arriving 5 seconds apart -> BOTH must be booked (total ¥6.60)
+        val r1 = ScreenBillParser.parse(
+            packageName = ScreenBillParser.PKG_WECHAT,
+            className = "com.tencent.mm.plugin.remittance.ui.RemittanceDetailUI",
+            rawTexts = listOf("你已收款，资金已存入零钱", "¥3.30", "查看零钱", "转账时间", "2026-11-26 13:05:00", "收款时间", "2026-11-26 13:05:10"),
+            observedAtMs = t0 + 500L,
+            zoneId = zone
+        )!!
+        assertEquals(ScreenIngestOutcome.ENQUEUED_NEW, engine.ingestScreenCapture(r1))
+        engine.flushExpired(true)
+
+        // 1b. Re-opening the EXACT SAME WeChat transfer bubble 30s later (new session) -> blocked by dual-second receiptDedupKey!
+        assertEquals(
+            ScreenIngestOutcome.ALREADY_EXISTS,
+            engine.ingestScreenCapture(r1.copy(observedAtMs = t0 + 30_000L))
+        )
+
+        val r2 = ScreenBillParser.parse(
+            packageName = ScreenBillParser.PKG_WECHAT,
+            className = "com.tencent.mm.plugin.remittance.ui.RemittanceDetailUI",
+            rawTexts = listOf("你已收款，资金已存入零钱", "¥3.30", "查看零钱", "转账时间", "2026-11-26 13:05:15", "收款时间", "2026-11-26 13:05:20"),
+            observedAtMs = t0 + 10_500L,
+            zoneId = zone
+        )!!
+        assertEquals(ScreenIngestOutcome.ENQUEUED_NEW, engine.ingestScreenCapture(r2))
+        engine.flushExpired(true)
+
+        assertEquals(2, store.listTransactions().size)
+        assertEquals(660L, engine.getSummary(t0).byCurrency["CNY"]!!.totalIncomeMinor)
+
+        // 1c. Opening an OLD (>5 min) WeChat transfer bubble never recorded before -> skipped as historical!
+        val staleBubble = ScreenBillParser.parse(
+            packageName = ScreenBillParser.PKG_WECHAT,
+            className = "com.tencent.mm.plugin.remittance.ui.RemittanceDetailUI",
+            rawTexts = listOf("你已收款，资金已存入零钱", "¥9.90", "查看零钱", "收款时间", "2026-11-26 09:00:00"),
+            observedAtMs = t0 + 60_000L,
+            zoneId = zone
+        )!!
+        assertEquals(ScreenIngestOutcome.SKIPPED_NO_MATCH, engine.ingestScreenCapture(staleBubble))
+        engine.flushExpired(true)
+        assertEquals(2, store.listTransactions().size)
+
+        // 2. Browsing an unrelated historical bill detail from last month MUST NOT create a fake row
+        val oldBill = ScreenBillParser.parse(
+            packageName = ScreenBillParser.PKG_WECHAT,
+            className = "com.tencent.mm.plugin.mall.ui.MallTransactionDetailUI",
+            rawTexts = listOf(
+                "返回", "老乡鸡", "-24.50",
+                "当前状态", "支付成功",
+                "支付时间", "2026年10月12日 12:00:00",
+                "交易单号", "42000011223344556677"
+            ),
+            observedAtMs = t0 + 60_000L,
+            zoneId = zone
+        )!!
+        assertEquals(ScreenIngestOutcome.SKIPPED_NO_MATCH, engine.ingestScreenCapture(oldBill))
+        engine.flushExpired(true)
+        assertEquals(2, store.listTransactions().size)
+    }
+
+    @Test
+    fun concurrentBillDetailRacingWithFlushAndDuplicateExternalIdProduceStrictlyOneTx() {
+        val zone = java.time.ZoneId.of("Asia/Shanghai")
+        val t0 = ScreenBillParser.parseDateTimeMs("2026-11-26 16:00:00", zone)!!
+
+        // 1. Race BILL_DETAIL against flushExpired repeatedly with CountDownLatch
+        repeat(15) { iter ->
+            val store = InMemoryLedgerStore()
+            val engine = LedgerEngine(store)
+            engine.ingestNotification(
+                RawNotification("com.tencent.mm", "微信", "微信支付", "微信支付凭证：已支付¥18.00", t0, notificationId = "n-$iter")
+            )
+            val detail = ScreenBillParser.parse(
+                packageName = ScreenBillParser.PKG_WECHAT,
+                className = "MallTransactionDetailUI",
+                rawTexts = listOf(
+                    "返回", "瑞幸咖啡", "-18.00",
+                    "当前状态", "支付成功",
+                    "支付时间", "2026年11月26日 16:00:02",
+                    "交易单号", "4200007777000000${1000 + iter}"
+                ),
+                observedAtMs = t0 + 3_000L,
+                zoneId = zone
+            )!!
+
+            val ready = java.util.concurrent.CountDownLatch(2)
+            val start = java.util.concurrent.CountDownLatch(1)
+            val tFlush = Thread {
+                ready.countDown(); start.await()
+                engine.flushExpired(true)
+            }
+            val tDetail = Thread {
+                ready.countDown(); start.await()
+                engine.ingestScreenCapture(detail)
+            }
+            tFlush.start(); tDetail.start()
+            ready.await(); start.countDown()
+            tFlush.join(); tDetail.join()
+            engine.flushExpired(true)
+
+            assertEquals("Iter $iter must produce strictly 1 tx", 1, store.listTransactions().size)
+            assertEquals("瑞幸咖啡", store.listTransactions().single().merchant)
+        }
+
+        // 2. Two concurrent threads submitting same live PAY_SUCCESS with identical real order ID -> strictly 1 tx
+        val store2 = InMemoryLedgerStore()
+        val engine2 = LedgerEngine(store2)
+        val liveOrder = ScreenBillParser.parse(
+            packageName = ScreenBillParser.PKG_WECHAT,
+            className = "WalletOrderInfoNewUI",
+            rawTexts = listOf("支付成功", "星巴克", "¥35.00", "交易单号", "42000055556666777788"),
+            observedAtMs = t0
+        )!!
+        val ready2 = java.util.concurrent.CountDownLatch(2)
+        val start2 = java.util.concurrent.CountDownLatch(1)
+        val outcomes = java.util.concurrent.CopyOnWriteArrayList<ScreenIngestOutcome>()
+        val w1 = Thread { ready2.countDown(); start2.await(); outcomes.add(engine2.ingestScreenCapture(liveOrder)) }
+        val w2 = Thread { ready2.countDown(); start2.await(); outcomes.add(engine2.ingestScreenCapture(liveOrder)) }
+        w1.start(); w2.start()
+        ready2.await(); start2.countDown()
+        w1.join(); w2.join()
+        engine2.flushExpired(true)
+
+        assertTrue(ScreenIngestOutcome.ALREADY_EXISTS in outcomes)
+        assertEquals(1, store2.listTransactions().size)
+    }
+
+    @Test
+    fun failedRestorePreservesDeferredNotificationAndSuccessfulRestoreReplaysScreenIdempotently() {
+        val zone = java.time.ZoneId.of("Asia/Shanghai")
+        val t0 = ScreenBillParser.parseDateTimeMs("2026-11-26 17:00:00", zone)!!
+
+        // 1. Restore throws while notification arrives mid-barrier -> notification MUST still be replayed & booked!
+        val store1 = InMemoryLedgerStore()
+        val engine1 = LedgerEngine(store1)
+        val midNotif = RawNotification("com.tencent.mm", "微信", "微信支付", "向蜜雪冰城付款12.00元", t0)
+        assertThrows(RuntimeException::class.java) {
+            engine1.withRestoreBarrier {
+                engine1.ingestNotification(midNotif)
+                throw RuntimeException("simulated restore failure")
+            }
+        }
+        engine1.flushExpired(true)
+        assertEquals(1, store1.listTransactions().size)
+        assertEquals(1200L, store1.listTransactions().single().amountMinor)
+
+        // 2. Successful restore contains order externalId; same screen capture arrives mid-restore -> replayed idempotently!
+        val srcStore = InMemoryLedgerStore()
+        val srcEngine = LedgerEngine(srcStore)
+        srcEngine.ingestNotification(RawNotification("com.tencent.mm", "微信", "微信支付", "微信支付凭证：已支付¥25.00", t0))
+        srcEngine.flushExpired(true)
+        val existingDetail = ScreenBillParser.parse(
+            packageName = ScreenBillParser.PKG_WECHAT,
+            className = "MallTransactionDetailUI",
+            rawTexts = listOf(
+                "返回", "瑞幸咖啡", "-25.00",
+                "当前状态", "支付成功",
+                "支付时间", "2026年11月26日 17:00:05",
+                "交易单号", "42000033334444555566"
+            ),
+            observedAtMs = t0 + 5_000L,
+            zoneId = zone
+        )!!
+        assertEquals(ScreenIngestOutcome.BACKFILLED_COMMITTED, srcEngine.ingestScreenCapture(existingDetail))
+        val snapshot = srcStore.exportLogicalSnapshot(t0 + 10_000L)
+
+        val dstStore = InMemoryLedgerStore()
+        val dstEngine = LedgerEngine(dstStore)
+        dstEngine.withRestoreBarrier {
+            dstStore.restoreFromSnapshot(snapshot)
+            // Same order arrives mid-restore as a live screen capture -> deferred as Screen, NOT downgraded to RawNotification
+            val sameOrderScreen = existingDetail.copy(pageKind = ScreenPageKind.PAY_SUCCESS)
+            assertEquals(ScreenIngestOutcome.DEFERRED_RESTORE, dstEngine.ingestScreenCapture(sameOrderScreen))
+        }
+        dstEngine.flushExpired(true)
+        assertEquals(1, dstStore.listTransactions().size)
+        assertEquals("瑞幸咖啡", dstStore.listTransactions().single().merchant)
+    }
+
+    @Test
+    fun localItemDescriptionImprovesOfflineSummaryAndCategoryWithoutEnteringCloudText() {
+        val store = InMemoryLedgerStore()
+        val engine = LedgerEngine(store)
+        val t0 = 1_700_000_000_000L
+
+        val capture = ScreenBillParser.parse(
+            packageName = ScreenBillParser.PKG_WECHAT,
+            className = "WalletOrderInfoNewUI",
+            rawTexts = listOf(
+                "支付成功",
+                "益康大门口",
+                "¥45.00",
+                "商品",
+                "药店感冒药两盒",
+                "完成"
+            ),
+            observedAtMs = t0
+        )!!
+        // Cloud-bound content excludes raw item description, while localItemHint carries it for offline use
+        assertFalse(capture.toRawNotification().content.contains("感冒药"))
+        assertEquals("药店感冒药两盒", capture.toRawNotification().localItemHint)
+
+        assertEquals(ScreenIngestOutcome.ENQUEUED_NEW, engine.ingestScreenCapture(capture))
+        engine.flushExpired(true)
+
+        val tx = store.listTransactions().single()
+        assertEquals("药店感冒药两盒", tx.itemSummary)
+        assertEquals("医疗健康", tx.category)
+        assertFalse(tx.sanitizedText.contains("感冒药"))
+    }
+
+    @Test
+    fun noTimeAlreadyProcessedAndAmbiguousBillDetailsNeverPolluteActiveBuffer() {
+        val zone = java.time.ZoneId.of("Asia/Shanghai")
+        val t0 = ScreenBillParser.parseDateTimeMs("2026-11-26 18:00:00", zone)!!
+
+        // Case 1: Today's ¥3.30 bank notification is in buffer; old WeChat BILL_DETAIL WITHOUT timestamp arrives!
+        val store1 = InMemoryLedgerStore()
+        val engine1 = LedgerEngine(store1)
+        engine1.ingestNotification(
+            RawNotification("cmb.pb", "招商银行", "动账提醒", "尾号6288消费人民币3.30元，商户：财付通", t0, notificationId = "bank-today-1")
+        )
+        val noTimeOldDetail = ScreenBillParser.parse(
+            packageName = ScreenBillParser.PKG_WECHAT,
+            className = "MallTransactionDetailUI",
+            rawTexts = listOf(
+                "账单详情", "历史旧店铺", "-3.30",
+                "当前状态", "支付成功",
+                "交易单号", "42000010101010101010"
+            ),
+            observedAtMs = t0 + 5_000L,
+            zoneId = zone
+        )!!
+        assertNull(noTimeOldDetail.eventTimeMs)
+        assertEquals(ScreenIngestOutcome.SKIPPED_NO_MATCH, engine1.ingestScreenCapture(noTimeOldDetail))
+        engine1.flushExpired(true)
+        val tx1 = store1.listTransactions().single()
+        assertEquals("未知商户", tx1.merchant)
+        assertEquals(1, tx1.mergedNotifications)
+        assertEquals(1, store1.listSourcesForTransaction(tx1.id).size)
+
+        // Case 2: Order #1 already committed in DB; today's new ¥3.30 notification is in buffer; re-opening Order #1
+        //         MUST return ALREADY_EXISTS before touching today's buffer!
+        val store2 = InMemoryLedgerStore()
+        val engine2 = LedgerEngine(store2)
+        engine2.ingestNotification(
+            RawNotification("com.tencent.mm", "微信", "微信支付", "微信支付凭证：已支付¥3.30", t0, notificationId = "wx-1")
+        )
+        engine2.flushExpired(true)
+        val order1Detail = ScreenBillParser.parse(
+            packageName = ScreenBillParser.PKG_WECHAT,
+            className = "MallTransactionDetailUI",
+            rawTexts = listOf(
+                "返回", "旧商户一", "-3.30",
+                "当前状态", "支付成功",
+                "支付时间", "2026年11月26日 18:00:05",
+                "交易单号", "42000020202020202020"
+            ),
+            observedAtMs = t0 + 10_000L,
+            zoneId = zone
+        )!!
+        assertEquals(ScreenIngestOutcome.BACKFILLED_COMMITTED, engine2.ingestScreenCapture(order1Detail))
+
+        // Second real ¥3.30 purchase enters active buffer 15s later
+        engine2.ingestNotification(
+            RawNotification("com.tencent.mm", "微信", "微信支付", "微信支付凭证：已支付¥3.30", t0 + 15_000L, notificationId = "wx-2")
+        )
+        // Re-opening Order #1 while Order #2 is in buffer -> MUST be rejected as ALREADY_EXISTS, NOT merged into Order #2!
+        assertEquals(ScreenIngestOutcome.ALREADY_EXISTS, engine2.ingestScreenCapture(order1Detail.copy(observedAtMs = t0 + 16_000L)))
+        engine2.flushExpired(true)
+
+        val txs2 = store2.listTransactions().sortedBy { it.occurredAtMs }
+        assertEquals(2, txs2.size)
+        assertEquals("旧商户一", txs2[0].merchant)
+        assertEquals("未知商户", txs2[1].merchant)
+        assertEquals(1, txs2[1].mergedNotifications)
+        assertEquals(1, store2.listSourcesForTransaction(txs2[1].id).size)
+
+        // Case 3: Two compatible ¥3.30 buffers active simultaneously -> BILL_DETAIL skips as AMBIGUOUS!
+        val store3 = InMemoryLedgerStore()
+        val engine3 = LedgerEngine(store3)
+        engine3.ingestNotification(
+            RawNotification("com.tencent.mm", "微信", "微信支付", "微信支付凭证：已支付¥3.30", t0, notificationId = "wx-a")
+        )
+        engine3.ingestNotification(
+            RawNotification("com.tencent.mm", "微信", "微信支付", "微信支付凭证：已支付¥3.30", t0 + 2_000L, notificationId = "wx-b")
+        )
+        val ambigDetail = ScreenBillParser.parse(
+            packageName = ScreenBillParser.PKG_WECHAT,
+            className = "MallTransactionDetailUI",
+            rawTexts = listOf(
+                "返回", "蜜雪冰城", "-3.30",
+                "当前状态", "支付成功",
+                "支付时间", "2026年11月26日 18:00:01",
+                "交易单号", "42000030303030303030"
+            ),
+            observedAtMs = t0 + 4_000L,
+            zoneId = zone
+        )!!
+        assertEquals(ScreenIngestOutcome.SKIPPED_AMBIGUOUS, engine3.ingestScreenCapture(ambigDetail))
+        engine3.flushExpired(true)
+        val txs3 = store3.listTransactions()
+        assertEquals(2, txs3.size)
+        assertTrue(txs3.all { it.merchant == "未知商户" && it.mergedNotifications == 1 })
+
+        // Case 4: Buffer already holds a notification with strong externalId A -> BILL_DETAIL with DIFFERENT externalId B does NOT merge!
+        val store4 = InMemoryLedgerStore()
+        val engine4 = LedgerEngine(store4)
+        engine4.ingestNotification(
+            RawNotification(
+                appPackage = ScreenBillParser.PKG_WECHAT,
+                appName = "微信",
+                title = "微信支付",
+                content = "微信支付凭证：已支付¥3.30",
+                timestampMs = t0,
+                notificationId = "wx-order-a",
+                externalId = "scr_existing_order_a"
+            )
+        )
+        val detailB = ScreenBillParser.parse(
+            packageName = ScreenBillParser.PKG_WECHAT,
+            className = "MallTransactionDetailUI",
+            rawTexts = listOf(
+                "返回", "瑞幸咖啡", "-3.30",
+                "当前状态", "支付成功",
+                "支付时间", "2026年11月26日 18:00:01",
+                "交易单号", "42000040404040404042"
+            ),
+            observedAtMs = t0 + 2_000L,
+            zoneId = zone
+        )!!
+        assertEquals(ScreenIngestOutcome.SKIPPED_NO_MATCH, engine4.ingestScreenCapture(detailB))
+        engine4.flushExpired(true)
+        val tx4 = store4.listTransactions().single()
+        assertEquals("未知商户", tx4.merchant)
+        assertEquals(1, tx4.mergedNotifications)
+        // Case 5: Old BILL_DETAIL whose ONLY date sits inside "备注" ("预约时间 2026-11-26 10:30:00")
+        //         MUST NOT use the remark date to pollute a same-time same-amount new transaction!
+        val store5 = InMemoryLedgerStore()
+        val engine5 = LedgerEngine(store5)
+        val tAppt = ScreenBillParser.parseDateTimeMs("2026-11-26 10:30:00", zone)!!
+        engine5.ingestNotification(
+            RawNotification("com.tencent.mm", "微信", "微信支付", "微信支付凭证：已支付¥3.30", tAppt, notificationId = "wx-appt-today")
+        )
+        val remarkDateDetail = ScreenBillParser.parse(
+            packageName = ScreenBillParser.PKG_WECHAT,
+            className = "MallTransactionDetailUI",
+            rawTexts = listOf("账单详情", "老店名称", "-3.30", "备注", "预约时间 2026-11-26 10:30:00"),
+            observedAtMs = tAppt + 5_000L,
+            zoneId = zone
+        )!!
+        assertNull(remarkDateDetail.eventTimeMs)
+        assertEquals(ScreenIngestOutcome.SKIPPED_NO_MATCH, engine5.ingestScreenCapture(remarkDateDetail))
+        engine5.flushExpired(true)
+        val tx5 = store5.listTransactions().single()
+        assertEquals("未知商户", tx5.merchant)
+        assertEquals(1, tx5.mergedNotifications)
+        assertEquals(1, store5.listSourcesForTransaction(tx5.id).size)
+    }
+
+    @Test
+    fun privateItemSentinelNeverAppearsAnywhereInFinalCloudRequestJson() {
+        val store = InMemoryLedgerStore()
+        val engine = LedgerEngine(store)
+        val t0 = 1_700_000_000_000L
+        val sentinel = "PRIVATE_ITEM_SENTINEL_9981"
+
+        // Case 1: Single-node item description right before amount with no merchant header
+        val capture = ScreenBillParser.parse(
+            packageName = ScreenBillParser.PKG_WECHAT,
+            className = "WalletOrderInfoNewUI",
+            rawTexts = listOf(
+                "支付成功",
+                "商品说明",
+                sentinel,
+                "¥3.30",
+                "完成"
+            ),
+            observedAtMs = t0
+        )!!
+        assertEquals("未知商户", capture.merchant)
+        assertEquals(sentinel, capture.itemDescription)
+
+        assertEquals(ScreenIngestOutcome.ENQUEUED_NEW, engine.ingestScreenCapture(capture))
+
+        // Inspect the EXACT serialized JSON request body that would be sent to an optional cloud LLM
+        val queuedPayload = store.listOfflineQueue().single().payload
+        val cloudBodyJson = AiClient.buildCloudRequestBody(
+            AiConfig(mode = AiConfig.MODE_REAL_API, baseUrl = "https://api.example.com/v1", apiKey = "test", model = "test-model"),
+            queuedPayload
+        ).toString()
+        assertFalse("Private item sentinel MUST NOT appear in any cloud request field", cloudBodyJson.contains(sentinel))
+        assertFalse("Private item sentinel MUST NOT appear in sanitizedText", queuedPayload.sanitizedText.contains(sentinel))
+
+        // Local offline flush still keeps local itemSummary cleanly
+        engine.flushExpired(true)
+        val tx = store.listTransactions().single()
+        assertEquals(sentinel, tx.itemSummary)
+        assertFalse(tx.sanitizedText.contains(sentinel))
+
+        // Case 2: Multi-node split free text WITH standalone date node ("商品说明 / 定制礼盒 / 2026-11-26 10:30:00 / 送给小林 / ¥19.90")
+        //         -> trailing unlabeled text MUST NEVER leak into merchant or cloud JSON!
+        val store2 = InMemoryLedgerStore()
+        val engine2 = LedgerEngine(store2)
+        val multiCapture = ScreenBillParser.parse(
+            packageName = ScreenBillParser.PKG_WECHAT,
+            className = "WalletOrderInfoNewUI",
+            rawTexts = listOf("支付成功", "商品说明", "定制礼盒", "2026-11-26 10:30:00", "送给小林", "¥19.90"),
+            observedAtMs = t0 + 10_000L
+        )!!
+        assertEquals("未知商户", multiCapture.merchant)
+        assertEquals("定制礼盒", multiCapture.itemDescription)
+        assertEquals(ScreenIngestOutcome.ENQUEUED_NEW, engine2.ingestScreenCapture(multiCapture))
+
+        val multiPayload = store2.listOfflineQueue().single().payload
+        val multiCloudJson = AiClient.buildCloudRequestBody(
+            AiConfig(mode = AiConfig.MODE_REAL_API, baseUrl = "https://api.example.com/v1", apiKey = "test", model = "test-model"),
+            multiPayload
+        ).toString()
+        assertFalse("Trailing free-text node '送给小林' MUST NOT appear anywhere in cloud JSON", multiCloudJson.contains("送给小林"))
+        assertFalse("First free-text node '定制礼盒' MUST NOT appear anywhere in cloud JSON", multiCloudJson.contains("定制礼盒"))
+
+        engine2.flushExpired(true)
+        val tx2 = store2.listTransactions().single()
+        assertEquals("未知商户", tx2.merchant)
+        assertEquals("定制礼盒", tx2.itemSummary)
+        assertFalse(tx2.sanitizedText.contains("送给小林"))
     }
 }

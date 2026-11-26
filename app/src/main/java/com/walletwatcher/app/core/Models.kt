@@ -257,7 +257,11 @@ data class RawNotification(
     val subMessages: List<String> = emptyList(),
     val notificationId: String = UUID.randomUUID().toString(),
     val fromSummary: Boolean = false,
-    val externalId: String? = null
+    val externalId: String? = null,
+    val merchantOverride: String? = null,
+    val ambiguityOverride: String? = null,
+    val localItemHint: String? = null,
+    val dedupFingerprintOverride: String? = null
 )
 
 data class ParsedClue(
@@ -319,7 +323,9 @@ data class MergedPayload(
     val isZeroAuth: Boolean,
     val deepLink: String,
     val deepLinkLabel: String,
-    val sources: List<TransactionSource> = emptyList()
+    val sources: List<TransactionSource> = emptyList(),
+    val merchantHintOverride: String? = null,
+    val localItemHint: String? = null
 ) {
     val amount: Double?
         get() = amountMinor?.let { MoneyMath.minorToDouble(it, scale) }
@@ -396,7 +402,9 @@ data class CurrencyTotals(
     val netBalanceMinor: Long,
     val recordedCount: Int,
     val needsReviewCount: Int,
-    val ignoredCount: Int
+    val ignoredCount: Int,
+    val internalTransferCount: Int = 0,
+    val otherIgnoredCount: Int = 0
 )
 
 data class LedgerSummary(
@@ -409,6 +417,8 @@ data class LedgerSummary(
     val recordedCount: Int,
     val needsReviewCount: Int = 0,
     val ignoredCount: Int,
+    val internalTransferCount: Int = 0,
+    val otherIgnoredCount: Int = 0,
     val offlineQueueCount: Int,
     val dbSizeBytes: Long,
     val byCurrency: Map<String, CurrencyTotals> = emptyMap()

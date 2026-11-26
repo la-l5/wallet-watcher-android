@@ -1,0 +1,297 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:background="@color/bg_page">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="12dp">
+
+        <!-- 卡片 1：通知使用权（必选底座） -->
+        <LinearLayout
+            android:id="@+id/cardStepNotify"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="8dp"
+            android:background="@color/surface"
+            android:elevation="1dp"
+            android:orientation="vertical"
+            android:padding="12dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="1. 通知使用权（核心底座）"
+                    android:textColor="@color/text_main"
+                    android:textSize="14sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:id="@+id/tvStepNotifyStatus"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:paddingHorizontal="8dp"
+                    android:paddingVertical="2dp"
+                    android:text="未开启"
+                    android:textSize="11sp"
+                    android:textStyle="bold" />
+            </LinearLayout>
+
+            <TextView
+                android:id="@+id/tvStepNotifyDesc"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="自动监听微信、支付宝、银行及短信动账通知，全部在本地解析。"
+                android:textColor="@color/text_muted"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/btnStepNotify"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="36dp"
+                android:layout_marginTop="8dp"
+                android:text="一键直达通知使用权"
+                android:textSize="12sp" />
+        </LinearLayout>
+
+        <!-- 卡片 2：忽略电池优化（必选保活） -->
+        <LinearLayout
+            android:id="@+id/cardStepBattery"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="8dp"
+            android:background="@color/surface"
+            android:elevation="1dp"
+            android:orientation="vertical"
+            android:padding="12dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="2. 忽略电池优化（防息屏断连）"
+                    android:textColor="@color/text_main"
+                    android:textSize="14sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:id="@+id/tvStepBatteryStatus"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:paddingHorizontal="8dp"
+                    android:paddingVertical="2dp"
+                    android:text="待豁免"
+                    android:textSize="11sp"
+                    android:textStyle="bold" />
+            </LinearLayout>
+
+            <TextView
+                android:id="@+id/tvStepBatteryDesc"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="点击后在应用内直接弹出系统豁免确认框，返回即自动变绿。"
+                android:textColor="@color/text_muted"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/btnStepBattery"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="36dp"
+                android:layout_marginTop="8dp"
+                android:text="应用内弹窗允许"
+                android:textSize="12sp" />
+        </LinearLayout>
+
+        <!-- 卡片 3：厂商自启动管理（按机型直达） -->
+        <LinearLayout
+            android:id="@+id/cardStepOem"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="8dp"
+            android:background="@color/surface"
+            android:elevation="1dp"
+            android:orientation="vertical"
+            android:padding="12dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:id="@+id/tvStepOemTitle"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="3. 厂商自启动与后台保活"
+                    android:textColor="@color/text_main"
+                    android:textSize="14sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:id="@+id/tvStepOemStatus"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:paddingHorizontal="8dp"
+                    android:paddingVertical="2dp"
+                    android:text="建议设置"
+                    android:textSize="11sp"
+                    android:textStyle="bold" />
+            </LinearLayout>
+
+            <TextView
+                android:id="@+id/tvStepOemDesc"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="关闭自动管理，手动开启自启动与后台活动，防止跨夜被系统清理。"
+                android:textColor="@color/text_muted"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/btnStepOem"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="36dp"
+                android:layout_marginTop="8dp"
+                android:text="直达启动管理"
+                android:textSize="12sp" />
+        </LinearLayout>
+
+        <!-- 卡片 4：极简只读屏幕增强（自愿可选） -->
+        <LinearLayout
+            android:id="@+id/cardStepScreen"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="8dp"
+            android:background="@color/surface"
+            android:elevation="1dp"
+            android:orientation="vertical"
+            android:padding="12dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="4. 微信/支付宝只读增强（可选）"
+                    android:textColor="@color/text_main"
+                    android:textSize="14sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:id="@+id/tvStepScreenStatus"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:paddingHorizontal="8dp"
+                    android:paddingVertical="2dp"
+                    android:text="默认关闭"
+                    android:textSize="11sp"
+                    android:textStyle="bold" />
+            </LinearLayout>
+
+            <TextView
+                android:id="@+id/tvStepScreenDesc"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="读取范围：仅限微信、支付宝的支付成功、收款成功与账单详情页。\n提取字段：仅结构化金额、商户名、方式、时间、脱敏商品名与哈希订单号；绝不上传转账备注原文，绝不读聊天或密码页，无手势点击权限。\n存储与关闭：默认纯离线仅存本机（开启自有 AI 时仅发脱敏结构化摘要），随时可在系统无障碍中关闭。"
+                android:textColor="@color/text_muted"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/btnStepScreen"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="36dp"
+                android:layout_marginTop="8dp"
+                android:text="一键直达无障碍开关"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/btnScreenRestrictedHelp"
+                style="@style/Widget.MaterialComponents.Button.TextButton"
+                android:layout_width="wrap_content"
+                android:layout_height="32dp"
+                android:layout_gravity="end"
+                android:text="Android 13+ 开关灰掉？直达应用详情 →"
+                android:textSize="11sp"
+                android:visibility="gone" />
+        </LinearLayout>
+
+        <!-- 条件提示卡：Android 13–15 侧载受限设置 -->
+        <LinearLayout
+            android:id="@+id/cardRestrictedHint"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="8dp"
+            android:background="@color/status_warn_bg"
+            android:orientation="vertical"
+            android:padding="10dp"
+            android:visibility="gone">
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Android 13–15 侧载遇到「受限设置」灰掉怎么办？"
+                android:textColor="@color/status_warn_text"
+                android:textSize="12sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="3dp"
+                android:text="先在上方开关点一次触发提示 → 点下方按钮直达应用详情 → 右上角 ⋮ 点「允许受限设置」→ 返回即可打开。"
+                android:textColor="@color/text_main"
+                android:textSize="11sp" />
+
+            <Button
+                android:id="@+id/btnOpenAppDetails"
+                style="@style/Widget.MaterialComponents.Button.TextButton"
+                android:layout_width="wrap_content"
+                android:layout_height="34dp"
+                android:layout_gravity="end"
+                android:text="一键直达应用详情 →"
+                android:textSize="12sp" />
+        </LinearLayout>
+
+        <!-- 极简可验证运行状态 -->
+        <TextView
+            android:id="@+id/tvPipelineDiagnostics"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="#F8FAFC"
+            android:padding="8dp"
+            android:text="运行诊断加载中..."
+            android:textColor="@color/text_muted"
+            android:textSize="11sp" />
+
+    </LinearLayout>
+</ScrollView>

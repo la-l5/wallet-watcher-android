@@ -1,4 +1,6 @@
 <resources>
     <string name="app_name">钱包监测(MVP)</string>
     <string name="listener_service_label">钱包自动记账通知监听</string>
+    <string name="accessibility_service_label">钱包监测只读屏幕增强（可选）</string>
+    <string name="accessibility_service_description">仅在微信、支付宝的支付成功页、收款成功页与账单详情页只读提取结构化金额、商户名、支付方式、交易时间与哈希订单号，不保存或上传备注原文。绝不读取聊天页，绝不触碰支付密码页，无模拟点击或手势权限；默认纯离线仅存本机，随时可在此关闭。</string>
 </resources>

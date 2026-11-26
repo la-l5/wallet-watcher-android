@@ -113,16 +113,10 @@ object AiClient {
         return parseMock(profile, payload)
     }
 
-    private fun callOpenAiCompatible(
+    internal fun buildCloudRequestBody(
         config: AiConfig,
-        profile: UserProfile,
         payload: MergedPayload
-    ): AiParseResult {
-        var endpoint = config.baseUrl.trim().trimEnd('/')
-        if (!endpoint.endsWith("/chat/completions")) {
-            endpoint = "$endpoint/chat/completions"
-        }
-
+    ): JSONObject {
         val candidatesDesc = if (payload.candidates.isEmpty()) {
             "无候选"
         } else {
@@ -140,7 +134,7 @@ object AiClient {
             append("本地建议主候选=${payload.primaryCandidateId ?: "无"}，预提取支付方式=${payload.paymentMethod.ifBlank { "未知" }}")
         }
 
-        val bodyObj = JSONObject().apply {
+        return JSONObject().apply {
             put("model", config.model)
             put("temperature", 0.1)
             put("max_tokens", 512)
@@ -150,6 +144,19 @@ object AiClient {
                 put(JSONObject().put("role", "user").put("content", userPrompt))
             })
         }
+    }
+
+    private fun callOpenAiCompatible(
+        config: AiConfig,
+        profile: UserProfile,
+        payload: MergedPayload
+    ): AiParseResult {
+        var endpoint = config.baseUrl.trim().trimEnd('/')
+        if (!endpoint.endsWith("/chat/completions")) {
+            endpoint = "$endpoint/chat/completions"
+        }
+
+        val bodyObj = buildCloudRequestBody(config, payload)
 
         val url = URL(endpoint)
         require(url.protocol == "https") { "API 地址需要 HTTPS" }
@@ -266,10 +273,13 @@ object AiClient {
         val currency = payload.currency
         val scale = payload.scale
         val payMethod = payload.paymentMethod.ifBlank { "默认钱包" }
+        val preferredMerchant = payload.merchantHintOverride
+            ?.trim()
+            ?.takeIf { it.length >= 2 && it != "未知商户" && it !in GENERIC_GATEWAY_MERCHANTS }
 
         // 1. 0-yuan pay-later authorization
         if (payload.isZeroAuth) {
-            val merchant = extractMerchant(text)
+            val merchant = preferredMerchant ?: extractMerchant(text)
             return AiParseResult(
                 direction = TxDirection.IGNORED,
                 amountMinor = amountMinor,
@@ -289,7 +299,7 @@ object AiClient {
         // 2. Internal transfer checks
         val internalReason = payload.preInternalReason ?: detectInternalReason(text, profile)
         if (internalReason != null) {
-            var merchant = extractMerchant(text)
+            var merchant = preferredMerchant ?: extractMerchant(text)
             if (merchant == "未知商户") {
                 merchant = profile.brokers.firstOrNull { text.contains(it) }
                     ?: when {
@@ -320,7 +330,7 @@ object AiClient {
         // 3. AA split return or company reimbursement -> distinct REIMBURSEMENT_OFFSET (not merchant REFUND!)
         val offsetKeywords = listOf("AA返还", "AA收款", "朋友返还", "分摊返还", "报销", "差旅报销", "垫付返还")
         if (payload.roughDirection == "OFFSET" || offsetKeywords.any { text.contains(it, ignoreCase = true) }) {
-            val merchant = extractMerchant(text).let { if (it == "未知商户" && text.contains("报销")) "公司报销" else if (it == "未知商户") "AA分摊返还" else it }
+            val merchant = (preferredMerchant ?: extractMerchant(text)).let { if (it == "未知商户" && text.contains("报销")) "公司报销" else if (it == "未知商户") "AA分摊返还" else it }
             return AiParseResult(
                 direction = TxDirection.REIMBURSEMENT_OFFSET,
                 amountMinor = amountMinor,
@@ -340,7 +350,7 @@ object AiClient {
         // 4. Merchant Refund
         val refundKeywords = listOf("退款", "已退回", "退回原账户", "退货成功", "原路退回")
         if (payload.roughDirection == "REFUND" || refundKeywords.any { text.contains(it) }) {
-            val merchant = extractMerchant(text)
+            val merchant = preferredMerchant ?: extractMerchant(text)
             return AiParseResult(
                 direction = TxDirection.REFUND,
                 amountMinor = amountMinor,
@@ -384,8 +394,10 @@ object AiClient {
             reasoning = "通知表述较模糊，暂记为支出并标记待确认。"
         }
 
-        val merchant = extractMerchant(text)
+        val merchant = preferredMerchant ?: extractMerchant(text)
         val needsReview = payload.ambiguityReason != null || (merchant == "未知商户" && reasoning.contains("模糊"))
+        val localItem = payload.localItemHint?.trim()?.takeIf { it.length >= 2 }
+        val categoryText = if (localItem != null) "$text $localItem" else text
 
         return AiParseResult(
             direction = direction,
@@ -394,8 +406,8 @@ object AiClient {
             scale = scale,
             selectedCandidateId = payload.primaryCandidateId,
             merchant = merchant,
-            itemSummary = extractItemSummary(text, merchant, direction),
-            category = inferCategory(text, merchant, direction),
+            itemSummary = localItem ?: extractItemSummary(text, merchant, direction),
+            category = inferCategory(categoryText, merchant, direction),
             paymentMethod = payMethod,
             needsReview = needsReview,
             reasoning = payload.ambiguityReason ?: reasoning,
@@ -477,7 +489,7 @@ object AiClient {
         }
     }
 
-    private fun inferCategory(text: String, merchant: String, direction: TxDirection): String {
+    internal fun inferCategory(text: String, merchant: String, direction: TxDirection): String {
         return when (direction) {
             TxDirection.INTERNAL_TRANSFER -> "内部流转"
             TxDirection.IGNORED -> "忽略提醒"

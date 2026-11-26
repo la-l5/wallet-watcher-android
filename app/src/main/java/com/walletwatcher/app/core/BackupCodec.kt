@@ -544,6 +544,8 @@ object BackupCodec {
             put("deepLink", p.deepLink)
             put("deepLinkLabel", p.deepLinkLabel)
             put("sources", JSONArray().apply { for (s in p.sources) put(sourceToJson(s)) })
+            put("merchantHintOverride", p.merchantHintOverride ?: JSONObject.NULL)
+            put("localItemHint", p.localItemHint ?: JSONObject.NULL)
         }
     }
 
@@ -584,7 +586,9 @@ object BackupCodec {
             isZeroAuth = obj.optBoolean("isZeroAuth", false),
             deepLink = obj.optString("deepLink", ""),
             deepLinkLabel = obj.optString("deepLinkLabel", ""),
-            sources = sources
+            sources = sources,
+            merchantHintOverride = if (obj.isNull("merchantHintOverride")) null else obj.optString("merchantHintOverride").ifBlank { null },
+            localItemHint = if (obj.isNull("localItemHint")) null else obj.optString("localItemHint").ifBlank { null }
         )
         return OfflineQueueItem(
             queueId = obj.getString("queueId"),

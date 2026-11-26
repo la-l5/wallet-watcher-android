@@ -33,7 +33,29 @@ class WalletApp : Application() {
     var isListenerConnected: Boolean = false
 
     @Volatile
+    var isAccessibilityConnected: Boolean = false
+
+    @Volatile
     var lastObservedEventAtMs: Long = 0L
+
+    @Volatile
+    var lastScreenCaptureAtMs: Long = 0L
+
+    private val serviceStateListeners = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
+
+    fun addServiceStateListener(listener: () -> Unit) {
+        serviceStateListeners.add(listener)
+    }
+
+    fun removeServiceStateListener(listener: () -> Unit) {
+        serviceStateListeners.remove(listener)
+    }
+
+    fun notifyServiceStateChanged() {
+        for (l in serviceStateListeners) {
+            runCatching { l() }
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()

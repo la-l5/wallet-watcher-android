@@ -286,4 +286,127 @@ class LedgerDatabaseRobolectricTest {
             dstDb.close()
         }
     }
+
+    @Test
+    fun sqlitePersistsAccessibilityBackfillAndExternalIdIdempotency() {
+        val db = LedgerDatabase(context, freshDbName("screen_backfill"))
+        try {
+            val engine = LedgerEngine(db)
+            val zone = java.time.ZoneId.of("Asia/Shanghai")
+            val t0 = ScreenBillParser.parseDateTimeMs("2026-11-26 18:20:00", zone)!!
+
+            engine.ingestNotification(
+                RawNotification("com.tencent.mm", "微信", "微信支付", "微信支付凭证：已支付¥15.00", t0, notificationId = "n-1")
+            )
+            engine.flushExpired(true)
+            val original = db.listTransactions().single()
+            assertEquals("未知商户", original.merchant)
+
+            val detail = ScreenBillParser.parse(
+                packageName = ScreenBillParser.PKG_WECHAT,
+                className = "com.tencent.mm.plugin.mall.ui.MallTransactionDetailUI",
+                rawTexts = listOf(
+                    "返回", "全家便利店", "-15.00",
+                    "当前状态", "支付成功",
+                    "支付时间", "2026-11-26 18:20:05",
+                    "交易单号", "42000088776655443322"
+                ),
+                observedAtMs = t0 + 180_000L,
+                zoneId = zone
+            )!!
+            assertEquals(ScreenIngestOutcome.BACKFILLED_COMMITTED, engine.ingestScreenCapture(detail))
+            assertTrue(db.hasActiveSourceExternalId(detail.externalId!!))
+            assertEquals(ScreenIngestOutcome.ALREADY_EXISTS, engine.ingestScreenCapture(detail))
+
+            val updated = db.getTransaction(original.id)!!
+            assertEquals("全家便利店", updated.merchant)
+            assertEquals("餐饮", updated.category)
+            assertEquals(2, db.listSourcesForTransaction(updated.id).size)
+
+            // Undoing backfill removes link and frees active externalId in real SQLite!
+            val mergeOp = db.listChanges().first { it.opType == ChangeOpType.MERGE }
+            assertTrue(engine.undoChange(mergeOp.opId))
+            assertFalse(db.hasActiveSourceExternalId(detail.externalId!!))
+            assertEquals(1, db.listSourcesForTransaction(original.id).size)
+        } finally {
+            db.close()
+        }
+    }
+
+    @Test
+    fun sqliteFindBackfillCandidatesQueriesBeyond200RowsAndExcludesReverted() {
+        val db = LedgerDatabase(context, freshDbName("backfill_query"))
+        try {
+            val tOld = 1_700_000_000_000L
+            db.saveTransaction(
+                Transaction(
+                    id = "old-target",
+                    occurredAtMs = tOld,
+                    direction = TxDirection.EXPENSE,
+                    amountMinor = 330L,
+                    merchant = "未知商户",
+                    itemSummary = "未知商户 交易",
+                    category = "日用",
+                    paymentMethod = "微信零钱",
+                    sourceChannels = listOf("微信"),
+                    mergedNotifications = 1,
+                    status = TxStatus.RECORDED
+                )
+            )
+            db.saveTransaction(
+                Transaction(
+                    id = "old-reverted",
+                    occurredAtMs = tOld + 1000L,
+                    direction = TxDirection.EXPENSE,
+                    amountMinor = 330L,
+                    merchant = "未知商户",
+                    itemSummary = "已撤销",
+                    category = "日用",
+                    paymentMethod = "微信零钱",
+                    sourceChannels = listOf("微信"),
+                    mergedNotifications = 1,
+                    status = TxStatus.REVERTED
+                )
+            )
+            // Insert 205 newer transactions to exceed any 200-row scan limit
+            for (i in 1..205) {
+                db.saveTransaction(
+                    Transaction(
+                        id = "newer-$i",
+                        occurredAtMs = tOld + 86_400_000L + i * 1000L,
+                        direction = TxDirection.EXPENSE,
+                        amountMinor = 1000L + i,
+                        merchant = "商户$i",
+                        itemSummary = "消费",
+                        category = "日用",
+                        paymentMethod = "微信零钱",
+                        sourceChannels = listOf("微信"),
+                        mergedNotifications = 1,
+                        status = TxStatus.RECORDED
+                    )
+                )
+            }
+            val matches = db.findBackfillCandidates(330L, "CNY", tOld - 60_000L, tOld + 60_000L)
+            assertEquals(1, matches.size)
+            assertEquals("old-target", matches.single().id)
+
+            // Verify hasActiveSourceFingerprint works against real SQLite WAL
+            val engine = LedgerEngine(db)
+            val zone = java.time.ZoneId.of("Asia/Shanghai")
+            val rTime = ScreenBillParser.parseDateTimeMs("2026-11-26 13:05:10", zone)!!
+            val receipt = ScreenBillParser.parse(
+                packageName = ScreenBillParser.PKG_WECHAT,
+                className = "RemittanceDetailUI",
+                rawTexts = listOf("你已收款，资金已存入零钱", "¥3.30", "转账时间", "2026-11-26 13:05:00", "收款时间", "2026-11-26 13:05:10"),
+                observedAtMs = rTime + 1000L,
+                zoneId = zone
+            )!!
+            assertEquals(ScreenIngestOutcome.ENQUEUED_NEW, engine.ingestScreenCapture(receipt))
+            engine.flushExpired(true)
+            assertTrue(db.hasActiveSourceFingerprint(receipt.receiptDedupKey!!))
+            assertEquals(ScreenIngestOutcome.ALREADY_EXISTS, engine.ingestScreenCapture(receipt.copy(observedAtMs = rTime + 20_000L)))
+        } finally {
+            db.close()
+        }
+    }
 }

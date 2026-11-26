@@ -10,7 +10,6 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.provider.Settings
 import android.service.notification.NotificationListenerService
 import android.text.InputType
 import android.view.LayoutInflater
@@ -25,7 +24,6 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
-import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -35,6 +33,7 @@ import com.walletwatcher.app.WalletApp
 import com.walletwatcher.app.core.AiConfig
 import com.walletwatcher.app.core.MoneyMath
 import com.walletwatcher.app.core.RawNotification
+import com.walletwatcher.app.core.ScreenBillParser
 import com.walletwatcher.app.core.Transaction
 import com.walletwatcher.app.core.TxDirection
 import com.walletwatcher.app.core.TxStatus
@@ -57,6 +56,10 @@ class MainActivity : AppCompatActivity() {
     private var currentTab = Tab.LEDGER
 
     private lateinit var tvServiceStatus: TextView
+    private lateinit var btnPermissionPipeline: Button
+    private lateinit var btnScreenEnhance: Button
+    private lateinit var bannerPermissionTodo: LinearLayout
+    private lateinit var tvBannerTodo: TextView
     private lateinit var tvNetExpense: TextView
     private lateinit var tvIncome: TextView
     private lateinit var tvBalance: TextView
@@ -68,6 +71,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var logToolbar: LinearLayout
     private lateinit var recyclerView: RecyclerView
     private lateinit var adapter: TransactionAdapter
+
+    private var activePipelineRefresher: (() -> Unit)? = null
 
     private val screenJob = kotlinx.coroutines.SupervisorJob()
     private val screenScope = kotlinx.coroutines.CoroutineScope(screenJob + Dispatchers.IO)
@@ -151,6 +156,15 @@ class MainActivity : AppCompatActivity() {
         runOnUiThread { if (!isDestroyed && !isFinishing) refreshUi() }
     }
 
+    private val serviceStateListener: () -> Unit = {
+        runOnUiThread {
+            if (!isDestroyed && !isFinishing) {
+                refreshUi()
+                activePipelineRefresher?.invoke()
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
@@ -159,12 +173,13 @@ class MainActivity : AppCompatActivity() {
         setupListeners()
         requestPostNotificationIfNeeded()
         app.engine.addOnChangeListener(engineListener)
+        app.addServiceStateListener(serviceStateListener)
         refreshUi()
     }
 
     override fun onResume() {
         super.onResume()
-        if (isNotificationListenerGranted() && !app.isListenerConnected) {
+        if (PermissionRouter.isNotificationListenerGranted(this) && !app.isListenerConnected) {
             runCatching {
                 NotificationListenerService.requestRebind(
                     ComponentName(this, WalletNotificationListenerService::class.java)
@@ -172,10 +187,13 @@ class MainActivity : AppCompatActivity() {
             }
         }
         refreshUi()
+        activePipelineRefresher?.invoke()
     }
 
     override fun onDestroy() {
         app.engine.removeOnChangeListener(engineListener)
+        app.removeServiceStateListener(serviceStateListener)
+        activePipelineRefresher = null
         refreshJob?.cancel()
         screenJob.cancel()
         pendingBackupPassword?.fill('\u0000')
@@ -185,6 +203,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun bindViews() {
         tvServiceStatus = findViewById(R.id.tvServiceStatus)
+        btnPermissionPipeline = findViewById(R.id.btnPermissionPipeline)
+        btnScreenEnhance = findViewById(R.id.btnScreenEnhance)
+        bannerPermissionTodo = findViewById(R.id.bannerPermissionTodo)
+        tvBannerTodo = findViewById(R.id.tvBannerTodo)
         tvNetExpense = findViewById(R.id.tvNetExpense)
         tvIncome = findViewById(R.id.tvIncome)
         tvBalance = findViewById(R.id.tvBalance)
@@ -206,12 +228,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupListeners() {
-        findViewById<Button>(R.id.btnGrantNotify).setOnClickListener {
-            startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+        btnPermissionPipeline.setOnClickListener {
+            showPermissionPipelineDialog()
         }
 
-        findViewById<Button>(R.id.btnBatteryGuard).setOnClickListener {
-            showHonorGuardDialog()
+        btnScreenEnhance.setOnClickListener {
+            showPermissionPipelineDialog()
+        }
+
+        findViewById<Button>(R.id.btnBannerFix).setOnClickListener {
+            showPermissionPipelineDialog()
         }
 
         findViewById<Button>(R.id.btnSelfTest).setOnClickListener {
@@ -260,18 +286,41 @@ class MainActivity : AppCompatActivity() {
     private var refreshJob: kotlinx.coroutines.Job? = null
 
     private fun refreshUi() {
-        val granted = isNotificationListenerGranted()
+        val notifGranted = PermissionRouter.isNotificationListenerGranted(this)
+        val batteryExempt = PermissionRouter.isIgnoringBatteryOptimizations(this)
+        val screenEnabled = PermissionRouter.isAccessibilityServiceEnabled(this)
         val powerSave = app.isPowerSaveMode()
+
         val connText = when {
-            !granted -> "通知使用权未开启"
-            app.isListenerConnected -> "已授权 · 已绑定守护中"
-            powerSave -> "已授权但已断开（省电模式可能拦截，充电后可关开一次通知使用权恢复）"
-            else -> "已授权但未绑定（点“开通知权限”先关再开一次即可恢复）"
+            !notifGranted -> "通知未开"
+            app.isListenerConnected -> "通知守护中"
+            powerSave -> "通知已断(省电模式)"
+            else -> "通知已授权待重连"
+        }
+        val screenText = when {
+            screenEnabled && app.isAccessibilityConnected -> "屏幕只读中"
+            screenEnabled -> "屏幕已开"
+            else -> "屏幕关(可选)"
         }
         val netText = if (app.checkNetworkAvailable()) "在线" else "离线"
         val bufCount = app.engine.activeBufferCount()
-        tvServiceStatus.text = "监听：$connText | 网络：$netText | 引擎：${app.engine.aiConfig.displayLabel}" +
-            if (bufCount > 0) " | 缓冲中($bufCount)" else ""
+        tvServiceStatus.text = "$connText · $screenText | $netText | ${app.engine.aiConfig.displayLabel}" +
+            if (bufCount > 0) " | 缓冲($bufCount)" else ""
+
+        val coreReadyCount = (if (notifGranted) 1 else 0) + (if (batteryExempt) 1 else 0)
+        btnPermissionPipeline.text = if (coreReadyCount == 2) "权限已就绪 ✓" else "配权限 ($coreReadyCount/2)"
+        btnScreenEnhance.text = if (screenEnabled) "屏幕增强: 开" else "屏幕增强: 关"
+
+        if (coreReadyCount < 2) {
+            bannerPermissionTodo.visibility = View.VISIBLE
+            val missing = buildList {
+                if (!notifGranted) add("通知使用权")
+                if (!batteryExempt) add("忽略电池优化")
+            }.joinToString("、")
+            tvBannerTodo.text = "待开启：$missing（配置完返回即自动变绿）"
+        } else {
+            bannerPermissionTodo.visibility = View.GONE
+        }
 
         refreshJob?.cancel()
         val tab = currentTab
@@ -305,20 +354,16 @@ class MainActivity : AppCompatActivity() {
                 tvSubStats.text = "总支出 ${MoneyMath.formatUnsignedMinor(cny?.grossExpenseMinor ?: 0L)} · " +
                     "退款 ${MoneyMath.formatUnsignedMinor(cny?.totalRefundMinor ?: 0L)} · " +
                     "AA/报销 ${MoneyMath.formatUnsignedMinor(cny?.totalOffsetMinor ?: 0L)} · " +
-                    "待核对 ${summary.needsReviewCount} · 内部 ${summary.ignoredCount} · 队列 ${summary.offlineQueueCount} · ${dbKb}KB$foreignNote"
+                    "待核对 ${summary.needsReviewCount} · 内部互转 ${summary.internalTransferCount} · " +
+                    "广告/忽略 ${summary.otherIgnoredCount} · 队列 ${summary.offlineQueueCount} · ${dbKb}KB$foreignNote"
 
                 tabLedger.text = "主账本(${summary.recordedCount})"
-                tabIgnored.text = "已忽略(${summary.ignoredCount})"
+                tabIgnored.text = "内部/忽略(${summary.ignoredCount})"
 
                 adapter.submitList(rows)
                 tvEmpty.visibility = if (rows.isEmpty()) View.VISIBLE else View.GONE
             }
         }
-    }
-
-    private fun isNotificationListenerGranted(): Boolean {
-        val enabled = NotificationManagerCompat.getEnabledListenerPackages(this)
-        return packageName in enabled
     }
 
     private fun requestPostNotificationIfNeeded() {
@@ -337,42 +382,160 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun showHonorGuardDialog() {
-        val timeFmt = SimpleDateFormat("MM-dd HH:mm:ss", Locale.CHINA)
-        val lastEvt = if (app.lastObservedEventAtMs > 0L) timeFmt.format(Date(app.lastObservedEventAtMs)) else "尚未收到真实通知"
-        val factMsg = buildString {
-            appendLine("【当前可验证状态】")
-            appendLine("• 通知使用权：${if (isNotificationListenerGranted()) "已授权" else "未授权"}")
-            appendLine("• 监听服务绑定：${if (app.isListenerConnected) "已连接" else "未连接"}")
-            appendLine("• 电池优化豁免：${if (app.isIgnoringBatteryOptimizations()) "已豁免" else "受系统优化限制"}")
-            appendLine("• 系统省电模式：${if (app.isPowerSaveMode()) "开启中（可能暂停后台监听）" else "关闭"}")
-            appendLine("• 上次收到通知：$lastEvt")
-            appendLine("• 最近可读退出原因：${app.getLastReadableExitReason()}")
-            appendLine()
-            appendLine("【国产手机防低电量/锁屏断连清单】")
-            appendLine("1. 应用启动管理：关闭自动管理，手动全开「允许自启动、允许关联启动、允许后台活动」。")
-            appendLine("2. 多任务最近列表下拉加锁。")
-            appendLine("3. 若低电量后出现“已授权但未连接”，去「通知使用权」关闭再重新打开一次即可恢复。")
+    private fun showPermissionPipelineDialog() {
+        val view = LayoutInflater.from(this).inflate(R.layout.dialog_permission_pipeline, null)
+        val tvStepNotifyStatus = view.findViewById<TextView>(R.id.tvStepNotifyStatus)
+        val tvStepNotifyDesc = view.findViewById<TextView>(R.id.tvStepNotifyDesc)
+        val btnStepNotify = view.findViewById<Button>(R.id.btnStepNotify)
+
+        val tvStepBatteryStatus = view.findViewById<TextView>(R.id.tvStepBatteryStatus)
+        val btnStepBattery = view.findViewById<Button>(R.id.btnStepBattery)
+
+        val tvStepOemTitle = view.findViewById<TextView>(R.id.tvStepOemTitle)
+        val tvStepOemStatus = view.findViewById<TextView>(R.id.tvStepOemStatus)
+        val tvStepOemDesc = view.findViewById<TextView>(R.id.tvStepOemDesc)
+        val btnStepOem = view.findViewById<Button>(R.id.btnStepOem)
+
+        val tvStepScreenStatus = view.findViewById<TextView>(R.id.tvStepScreenStatus)
+        val btnStepScreen = view.findViewById<Button>(R.id.btnStepScreen)
+        val btnScreenRestrictedHelp = view.findViewById<Button>(R.id.btnScreenRestrictedHelp)
+
+        val cardRestrictedHint = view.findViewById<LinearLayout>(R.id.cardRestrictedHint)
+        val btnOpenAppDetails = view.findViewById<Button>(R.id.btnOpenAppDetails)
+        val tvPipelineDiagnostics = view.findViewById<TextView>(R.id.tvPipelineDiagnostics)
+
+        fun styleBadge(tv: TextView, text: String, bgColorRes: Int, textColorRes: Int) {
+            tv.text = text
+            tv.setBackgroundColor(ContextCompat.getColor(this, bgColorRes))
+            tv.setTextColor(ContextCompat.getColor(this, textColorRes))
         }
+
+        val refreshCards: () -> Unit = {
+            val notifGranted = PermissionRouter.isNotificationListenerGranted(this)
+            val batteryExempt = PermissionRouter.isIgnoringBatteryOptimizations(this)
+            val screenEnabled = PermissionRouter.isAccessibilityServiceEnabled(this)
+            val oemGuide = PermissionRouter.detectOemGuide()
+            val oemVisited = PermissionRouter.isOemAutoStartVisited(this)
+
+            // Step 1: Notification Listener
+            when {
+                notifGranted && app.isListenerConnected -> {
+                    styleBadge(tvStepNotifyStatus, "✓ 守护中", R.color.status_ok_bg, R.color.status_ok_text)
+                    tvStepNotifyDesc.text = "通知监听已绑定在线，正在自动识别支付与动账通知。"
+                    btnStepNotify.text = "已开启（点此可复查）"
+                }
+                notifGranted -> {
+                    styleBadge(tvStepNotifyStatus, "待重连", R.color.status_warn_bg, R.color.status_warn_text)
+                    tvStepNotifyDesc.text = "已授权但暂未绑定（省电或系统重启后常见），可进入先关再开恢复。"
+                    btnStepNotify.text = "一键直达重连"
+                }
+                else -> {
+                    styleBadge(tvStepNotifyStatus, "未开启", R.color.status_warn_bg, R.color.status_warn_text)
+                    tvStepNotifyDesc.text = "自动记账必备底座，开启后即可后台离线记录微信、支付宝和银行通知。"
+                    btnStepNotify.text = "一键直达通知使用权"
+                }
+            }
+
+            // Step 2: Battery Optimization
+            if (batteryExempt) {
+                styleBadge(tvStepBatteryStatus, "✓ 已豁免", R.color.status_ok_bg, R.color.status_ok_text)
+                btnStepBattery.text = "已豁免电池优化 ✓"
+                btnStepBattery.isEnabled = false
+            } else {
+                styleBadge(tvStepBatteryStatus, "待豁免", R.color.status_warn_bg, R.color.status_warn_text)
+                btnStepBattery.text = "应用内弹窗允许"
+                btnStepBattery.isEnabled = true
+            }
+
+            // Step 3: OEM Auto-Start (only shows "已打开启动管理" when a direct OEM page actually launched)
+            tvStepOemTitle.text = "3. ${oemGuide.displayName}保活（防杀后台）"
+            tvStepOemDesc.text = oemGuide.stepTip
+            if (oemVisited) {
+                styleBadge(tvStepOemStatus, "已打开过", R.color.status_ok_bg, R.color.status_ok_text)
+                btnStepOem.text = "复查${oemGuide.displayName}启动管理"
+            } else {
+                styleBadge(tvStepOemStatus, "建议开启", R.color.status_warn_bg, R.color.status_warn_text)
+                btnStepOem.text = "一键直达${oemGuide.displayName}启动管理"
+            }
+
+            // Step 4: Optional Read-Only Accessibility
+            when {
+                screenEnabled && app.isAccessibilityConnected -> {
+                    styleBadge(tvStepScreenStatus, "✓ 只读运行中", R.color.status_ok_bg, R.color.status_ok_text)
+                    btnStepScreen.text = "已开启（点此可随时关闭）"
+                }
+                screenEnabled -> {
+                    styleBadge(tvStepScreenStatus, "已开启·待绑定", R.color.status_warn_bg, R.color.status_warn_text)
+                    btnStepScreen.text = "已开启（点此管理）"
+                }
+                else -> {
+                    styleBadge(tvStepScreenStatus, "可选·已关", R.color.status_opt_bg, R.color.status_opt_text)
+                    btnStepScreen.text = "自愿开启只读屏幕增强"
+                }
+            }
+
+            // Show on-demand Restricted Settings helper under Step 4 on Android 13+ when Step 4 is off
+            btnScreenRestrictedHelp.visibility = if (
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !screenEnabled && notifGranted
+            ) View.VISIBLE else View.GONE
+
+            // Auto-show prominent Restricted Settings card ONLY when required Notification Listener is missing on Android 13+
+            cardRestrictedHint.visibility = if (
+                PermissionRouter.shouldAutoShowRestrictedBanner(notifGranted = notifGranted)
+            ) View.VISIBLE else View.GONE
+
+            // Live verifiable diagnostics footer
+            val timeFmt = SimpleDateFormat("MM-dd HH:mm:ss", Locale.CHINA)
+            val lastNotif = if (app.lastObservedEventAtMs > 0L) timeFmt.format(Date(app.lastObservedEventAtMs)) else "尚无"
+            val lastScreen = if (app.lastScreenCaptureAtMs > 0L) timeFmt.format(Date(app.lastScreenCaptureAtMs)) else "尚无"
+            val powerSaveText = if (app.isPowerSaveMode()) "省电模式开启" else "省电模式关闭"
+            tvPipelineDiagnostics.text = "最近通知：$lastNotif · 最近屏幕补全：$lastScreen\n$powerSaveText · 上次退出：${app.getLastReadableExitReason()}"
+        }
+
+        btnStepNotify.setOnClickListener {
+            PermissionRouter.openNotificationListenerSettings(this)
+        }
+        btnStepBattery.setOnClickListener {
+            PermissionRouter.requestIgnoreBatteryOptimizations(this)
+        }
+        btnStepOem.setOnClickListener {
+            val res = PermissionRouter.openOemAutoStartSettings(this)
+            if (!res.usedDirectOemPage) {
+                Toast.makeText(
+                    this,
+                    "当前系统未开放直达入口，已降级打开应用详情：${res.guide.stepTip}",
+                    Toast.LENGTH_LONG
+                ).show()
+            } else {
+                Toast.makeText(this, res.guide.stepTip, Toast.LENGTH_LONG).show()
+            }
+            refreshCards()
+        }
+        btnStepScreen.setOnClickListener {
+            PermissionRouter.openAccessibilitySettings(this)
+        }
+        btnScreenRestrictedHelp.setOnClickListener {
+            PermissionRouter.openAppDetails(this)
+            Toast.makeText(this, "点右上角 ⋮ → 允许受限设置，再返回开启无障碍", Toast.LENGTH_LONG).show()
+        }
+        btnOpenAppDetails.setOnClickListener {
+            PermissionRouter.openAppDetails(this)
+            Toast.makeText(this, "点右上角 ⋮ → 允许受限设置，再返回开启开关", Toast.LENGTH_LONG).show()
+        }
+
+        refreshCards()
+        activePipelineRefresher = refreshCards
+
         AlertDialog.Builder(this)
-            .setTitle("监听状态与后台保活")
-            .setMessage(factMsg)
-            .setPositiveButton("打开应用详情") { _, _ ->
-                val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
-                    data = Uri.parse("package:$packageName")
-                }
-                runCatching { startActivity(intent) }
+            .setTitle("一键权限配置与运行状态")
+            .setView(view)
+            .setNegativeButton("完成") { _, _ ->
+                activePipelineRefresher = null
+                refreshUi()
             }
-            .setNeutralButton("忽略电池优化") { _, _ ->
-                val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                    data = Uri.parse("package:$packageName")
-                }
-                runCatching { startActivity(intent) }
-                    .onFailure {
-                        runCatching { startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }
-                    }
+            .setOnDismissListener {
+                activePipelineRefresher = null
             }
-            .setNegativeButton("关闭", null)
             .show()
     }
 
@@ -423,7 +586,7 @@ class MainActivity : AppCompatActivity() {
                     })
                 }
                 if (tx.status != TxStatus.IGNORED) {
-                    actions.add("标为内部互转（移入已忽略）" to {
+                    actions.add("标为内部互转（移入内部/忽略）" to {
                         app.appScope.launch { app.engine.markAsInternal(tx.id, expectedRevision = tx.revision) }
                     })
                 }
@@ -490,7 +653,7 @@ class MainActivity : AppCompatActivity() {
                 app.engine.flushExpired(forceAll = true)
                 withContext(Dispatchers.Main) {
                     refreshUi()
-                    Toast.makeText(this@MainActivity, "自检完成！主账本应记 1 笔 ¥12.00，已忽略栏应拦 2 笔", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this@MainActivity, "自检完成！主账本应记 1 笔 ¥12.00，内部/忽略栏应拦 2 笔", Toast.LENGTH_LONG).show()
                 }
             } finally {
                 withContext(Dispatchers.Main) {
@@ -618,12 +781,36 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun openDeepLink(tx: Transaction) {
-        if (tx.deepLink.isBlank() || tx.deepLink.startsWith("walletwatcher://")) {
+        val link = tx.deepLink.trim()
+        if (link == "walletwatcher://launch/${ScreenBillParser.PKG_WECHAT}" || link.startsWith("weixin://")) {
+            if (PermissionRouter.openWeChatApp(this)) {
+                Toast.makeText(
+                    this,
+                    "已打开微信，请依次点击：我 → 服务 → 钱包 → 账单",
+                    Toast.LENGTH_LONG
+                ).show()
+            } else {
+                Toast.makeText(this, "未检测到已安装的微信 App", Toast.LENGTH_SHORT).show()
+            }
+            return
+        }
+        if (link.startsWith("walletwatcher://launch/")) {
+            val targetPkg = link.removePrefix("walletwatcher://launch/").trim()
+            val launchIntent = runCatching { packageManager.getLaunchIntentForPackage(targetPkg) }.getOrNull()
+            if (launchIntent != null) {
+                launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                runCatching { startActivity(launchIntent) }
+            } else {
+                Toast.makeText(this, "未能拉起目标 App（可能未安装）", Toast.LENGTH_SHORT).show()
+            }
+            return
+        }
+        if (link.isBlank() || link.startsWith("walletwatcher://")) {
             Toast.makeText(this, "脱敏摘要：\n${tx.sanitizedText.ifBlank { tx.aiReasoning }}", Toast.LENGTH_LONG).show()
             return
         }
         runCatching {
-            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(tx.deepLink)))
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(link)))
         }.onFailure {
             Toast.makeText(this, "未能拉起目标 App（可能未安装）", Toast.LENGTH_SHORT).show()
         }
