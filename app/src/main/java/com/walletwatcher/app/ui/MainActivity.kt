@@ -394,6 +394,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun showPermissionPipelineDialog() {
         val view = LayoutInflater.from(this).inflate(R.layout.dialog_permission_pipeline, null)
+        val btnNextPendingStep = view.findViewById<Button>(R.id.btnNextPendingStep)
         val tvStepNotifyStatus = view.findViewById<TextView>(R.id.tvStepNotifyStatus)
         val tvStepNotifyDesc = view.findViewById<TextView>(R.id.tvStepNotifyDesc)
         val btnStepNotify = view.findViewById<Button>(R.id.btnStepNotify)
@@ -405,6 +406,7 @@ class MainActivity : AppCompatActivity() {
         val tvStepOemStatus = view.findViewById<TextView>(R.id.tvStepOemStatus)
         val tvStepOemDesc = view.findViewById<TextView>(R.id.tvStepOemDesc)
         val btnStepOem = view.findViewById<Button>(R.id.btnStepOem)
+        val btnStepOemSkip = view.findViewById<Button>(R.id.btnStepOemSkip)
 
         val tvStepScreenStatus = view.findViewById<TextView>(R.id.tvStepScreenStatus)
         val btnStepScreen = view.findViewById<Button>(R.id.btnStepScreen)
@@ -425,7 +427,40 @@ class MainActivity : AppCompatActivity() {
             val batteryExempt = PermissionRouter.isIgnoringBatteryOptimizations(this)
             val screenEnabled = PermissionRouter.isAccessibilityServiceEnabled(this)
             val oemGuide = PermissionRouter.detectOemGuide()
+            val hasOemCandidates = oemGuide.candidates.isNotEmpty()
             val oemVisited = PermissionRouter.isOemAutoStartVisited(this)
+            val oemAcknowledged = PermissionRouter.isOemStepAcknowledged(this)
+
+            // Top one-tap relay button pointing directly to the next incomplete step
+            val totalRelaySteps = if (hasOemCandidates) 3 else 2
+            when (
+                PermissionRouter.resolveNextPendingStep(
+                    notifGranted = notifGranted,
+                    batteryExempt = batteryExempt,
+                    oemVisited = oemVisited,
+                    hasOemCandidates = hasOemCandidates,
+                    oemAcknowledged = oemAcknowledged
+                )
+            ) {
+                NextPermissionStep.NOTIFY -> {
+                    btnNextPendingStep.visibility = View.VISIBLE
+                    btnNextPendingStep.text = "下一步 (1/$totalRelaySteps)：去开启通知使用权 →"
+                    btnNextPendingStep.setOnClickListener { PermissionRouter.openNotificationListenerSettings(this) }
+                }
+                NextPermissionStep.BATTERY -> {
+                    btnNextPendingStep.visibility = View.VISIBLE
+                    btnNextPendingStep.text = "下一步 (2/$totalRelaySteps)：弹窗允许忽略电池优化 →"
+                    btnNextPendingStep.setOnClickListener { PermissionRouter.requestIgnoreBatteryOptimizations(this) }
+                }
+                NextPermissionStep.OEM_AUTOSTART -> {
+                    btnNextPendingStep.visibility = View.VISIBLE
+                    btnNextPendingStep.text = "下一步 (3/3)：去设置${oemGuide.displayName}防杀后台 →"
+                    btnNextPendingStep.setOnClickListener { btnStepOem.performClick() }
+                }
+                NextPermissionStep.ALL_READY -> {
+                    btnNextPendingStep.visibility = View.GONE
+                }
+            }
 
             // Step 1: Notification Listener
             when {
@@ -457,15 +492,30 @@ class MainActivity : AppCompatActivity() {
                 btnStepBattery.isEnabled = true
             }
 
-            // Step 3: OEM Auto-Start (only shows "已打开启动管理" when a direct OEM page actually launched)
+            // Step 3: OEM Auto-Start (distinguishes generic device, direct OEM opened, and manual skip/done)
             tvStepOemTitle.text = "3. ${oemGuide.displayName}保活（防杀后台）"
             tvStepOemDesc.text = oemGuide.stepTip
-            if (oemVisited) {
-                styleBadge(tvStepOemStatus, "已打开过", R.color.status_ok_bg, R.color.status_ok_text)
-                btnStepOem.text = "复查${oemGuide.displayName}启动管理"
-            } else {
-                styleBadge(tvStepOemStatus, "建议开启", R.color.status_warn_bg, R.color.status_warn_text)
-                btnStepOem.text = "一键直达${oemGuide.displayName}启动管理"
+            when {
+                !hasOemCandidates -> {
+                    styleBadge(tvStepOemStatus, "此机型无需", R.color.status_opt_bg, R.color.status_opt_text)
+                    btnStepOem.text = "查看应用详情（可选手动）"
+                    btnStepOemSkip.visibility = View.GONE
+                }
+                oemVisited -> {
+                    styleBadge(tvStepOemStatus, "✓ 已直达", R.color.status_ok_bg, R.color.status_ok_text)
+                    btnStepOem.text = "复查${oemGuide.displayName}启动管理"
+                    btnStepOemSkip.visibility = View.GONE
+                }
+                oemAcknowledged -> {
+                    styleBadge(tvStepOemStatus, "已手动处理", R.color.status_ok_bg, R.color.status_ok_text)
+                    btnStepOem.text = "复查${oemGuide.displayName}启动管理"
+                    btnStepOemSkip.visibility = View.GONE
+                }
+                else -> {
+                    styleBadge(tvStepOemStatus, "建议开启", R.color.status_warn_bg, R.color.status_warn_text)
+                    btnStepOem.text = "一键直达${oemGuide.displayName}启动管理"
+                    btnStepOemSkip.visibility = View.VISIBLE
+                }
             }
 
             // Step 4: Optional Read-Only Accessibility
@@ -494,12 +544,14 @@ class MainActivity : AppCompatActivity() {
                 PermissionRouter.shouldAutoShowRestrictedBanner(notifGranted = notifGranted)
             ) View.VISIBLE else View.GONE
 
-            // Live verifiable diagnostics footer
+            // Live verifiable diagnostics footer (strictly metadata-only, zero raw screen text; refreshes on return)
             val timeFmt = SimpleDateFormat("MM-dd HH:mm:ss", Locale.CHINA)
             val lastNotif = if (app.lastObservedEventAtMs > 0L) timeFmt.format(Date(app.lastObservedEventAtMs)) else "尚无"
             val lastScreen = if (app.lastScreenCaptureAtMs > 0L) timeFmt.format(Date(app.lastScreenCaptureAtMs)) else "尚无"
             val powerSaveText = if (app.isPowerSaveMode()) "省电模式开启" else "省电模式关闭"
-            tvPipelineDiagnostics.text = "最近通知：$lastNotif · 最近屏幕补全：$lastScreen\n$powerSaveText · 上次退出：${app.getLastReadableExitReason()}"
+            tvPipelineDiagnostics.text = "最近通知：$lastNotif · 最近屏幕补全：$lastScreen\n" +
+                "屏幕事件：收到 ${app.screenEventsCount} 次（返回本页刷新） · ${app.lastScreenDiagSummary}\n" +
+                "$powerSaveText · 上次退出：${app.getLastReadableExitReason()}"
         }
 
         btnStepNotify.setOnClickListener {
@@ -519,6 +571,10 @@ class MainActivity : AppCompatActivity() {
             } else {
                 Toast.makeText(this, res.guide.stepTip, Toast.LENGTH_LONG).show()
             }
+            refreshCards()
+        }
+        btnStepOemSkip.setOnClickListener {
+            PermissionRouter.markOemStepAcknowledged(this)
             refreshCards()
         }
         btnStepScreen.setOnClickListener {

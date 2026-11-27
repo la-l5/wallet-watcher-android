@@ -23,6 +23,13 @@ enum class OemFamily {
     GENERIC
 }
 
+enum class NextPermissionStep {
+    NOTIFY,
+    BATTERY,
+    OEM_AUTOSTART,
+    ALL_READY
+}
+
 data class OemAutoStartGuide(
     val family: OemFamily,
     val displayName: String,
@@ -49,6 +56,7 @@ object PermissionRouter {
     const val EXTRA_SHOW_FRAGMENT_ARGUMENTS = ":settings:show_fragment_args"
     private const val PREFS_NAME = "wallet_watcher_perm_prefs"
     private const val KEY_OEM_AUTOSTART_VISITED = "oem_autostart_visited"
+    private const val KEY_OEM_STEP_ACKNOWLEDGED = "oem_step_acknowledged"
 
     fun isNotificationListenerGranted(context: Context): Boolean {
         val enabled = runCatching {
@@ -96,6 +104,18 @@ object PermissionRouter {
             .apply()
     }
 
+    fun isOemStepAcknowledged(context: Context): Boolean {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_OEM_STEP_ACKNOWLEDGED, false)
+    }
+
+    fun markOemStepAcknowledged(context: Context) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_OEM_STEP_ACKNOWLEDGED, true)
+            .apply()
+    }
+
     fun needsRestrictedSettingsHint(
         sdkInt: Int = Build.VERSION.SDK_INT,
         notifGranted: Boolean,
@@ -113,6 +133,21 @@ object PermissionRouter {
         notifGranted: Boolean
     ): Boolean {
         return sdkInt >= Build.VERSION_CODES.TIRAMISU && !notifGranted
+    }
+
+    fun resolveNextPendingStep(
+        notifGranted: Boolean,
+        batteryExempt: Boolean,
+        oemVisited: Boolean,
+        hasOemCandidates: Boolean = true,
+        oemAcknowledged: Boolean = false
+    ): NextPermissionStep {
+        return when {
+            !notifGranted -> NextPermissionStep.NOTIFY
+            !batteryExempt -> NextPermissionStep.BATTERY
+            hasOemCandidates && !oemVisited && !oemAcknowledged -> NextPermissionStep.OEM_AUTOSTART
+            else -> NextPermissionStep.ALL_READY
+        }
     }
 
     fun detectOemGuide(

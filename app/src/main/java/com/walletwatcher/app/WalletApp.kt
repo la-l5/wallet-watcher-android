@@ -41,6 +41,12 @@ class WalletApp : Application() {
     @Volatile
     var lastScreenCaptureAtMs: Long = 0L
 
+    @Volatile
+    var screenEventsCount: Int = 0
+
+    @Volatile
+    var lastScreenDiagSummary: String = "尚无扫描事件"
+
     private val serviceStateListeners = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
 
     fun addServiceStateListener(listener: () -> Unit) {

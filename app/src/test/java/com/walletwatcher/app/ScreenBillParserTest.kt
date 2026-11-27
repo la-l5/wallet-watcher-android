@@ -180,12 +180,12 @@ class ScreenBillParserTest {
         assertFalse(res3.isSafeToParse)
         assertTrue(res3.texts.isEmpty())
 
-        // Case 4: Realistic WeChat payment page with 24 nesting levels and 300 sibling banner nodes -> accepted under 600/36 limits
+        // Case 4: Realistic WeChat payment page with 40 nesting levels and 900 sibling/banner nodes (as seen with flagIncludeNotImportantViews) -> accepted and records visitedNodes
         var deepLeaf = FakeNode(
             children = listOf(FakeNode(text = "支付成功"), FakeNode(text = "瑞幸咖啡"), FakeNode(text = "¥19.90"))
         )
-        repeat(22) { deepLeaf = FakeNode(children = listOf(deepLeaf)) }
-        val bannerSiblings = List(280) { FakeNode(text = "") }
+        repeat(38) { deepLeaf = FakeNode(children = listOf(deepLeaf)) }
+        val bannerSiblings = List(850) { FakeNode(text = "") }
         val realisticRoot = FakeNode(children = listOf(deepLeaf) + bannerSiblings)
         val res4 = AccessibilitySnapshotCollector.collect(
             eventPackage = ScreenBillParser.PKG_WECHAT,
@@ -195,6 +195,7 @@ class ScreenBillParserTest {
         )
         assertTrue(res4.isSafeToParse)
         assertFalse(res4.truncated)
+        assertTrue(res4.visitedNodes >= 890)
         assertTrue("支付成功" in res4.texts)
     }
 

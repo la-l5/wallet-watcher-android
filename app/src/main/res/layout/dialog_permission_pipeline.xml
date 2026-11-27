@@ -10,6 +10,53 @@
         android:orientation="vertical"
         android:padding="12dp">
 
+        <!-- 顶部一键接力主按钮：自动指向下一个未完成的必选/推荐步骤 -->
+        <Button
+            android:id="@+id/btnNextPendingStep"
+            android:layout_width="match_parent"
+            android:layout_height="42dp"
+            android:layout_marginBottom="8dp"
+            android:text="一键继续下一步 →"
+            android:textSize="13sp"
+            android:textStyle="bold" />
+
+        <!-- 前置第 0 步：Android 13–15 侧载受限设置提示卡（置顶，避免撞灰开关再绕回来） -->
+        <LinearLayout
+            android:id="@+id/cardRestrictedHint"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="8dp"
+            android:background="@color/status_warn_bg"
+            android:orientation="vertical"
+            android:padding="10dp"
+            android:visibility="gone">
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Android 13–15 侧载遇到「受限设置」灰掉怎么办？"
+                android:textColor="@color/status_warn_text"
+                android:textSize="12sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="3dp"
+                android:text="仅在系统明确提示「受限设置」导致开关灰掉时，先点此去应用详情 → 右上角 ⋮ 点「允许受限设置」，再返回开启开关。"
+                android:textColor="@color/text_main"
+                android:textSize="11sp" />
+
+            <Button
+                android:id="@+id/btnOpenAppDetails"
+                style="@style/Widget.MaterialComponents.Button.TextButton"
+                android:layout_width="wrap_content"
+                android:layout_height="34dp"
+                android:layout_gravity="end"
+                android:text="若提示受限，去应用详情解锁 →"
+                android:textSize="12sp" />
+        </LinearLayout>
+
         <!-- 卡片 1：通知使用权（必选底座） -->
         <LinearLayout
             android:id="@+id/cardStepNotify"
@@ -177,6 +224,16 @@
                 android:layout_marginTop="8dp"
                 android:text="直达启动管理"
                 android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/btnStepOemSkip"
+                style="@style/Widget.MaterialComponents.Button.TextButton"
+                android:layout_width="wrap_content"
+                android:layout_height="32dp"
+                android:layout_gravity="end"
+                android:text="我已手动设置 / 跳过此步"
+                android:textSize="11sp"
+                android:visibility="gone" />
         </LinearLayout>
 
         <!-- 卡片 4：极简只读屏幕增强（自愿可选） -->
@@ -221,7 +278,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="4dp"
-                android:text="读取范围：仅限微信、支付宝的支付成功、收款成功与账单详情页。\n提取字段：仅结构化金额、商户名、方式、时间、脱敏商品名与哈希订单号；绝不上传转账备注原文，绝不读聊天或密码页，无手势点击权限。\n存储与关闭：纯离线仅存本机，不上传任何账单内容，随时可在系统无障碍中关闭。"
+                android:text="读取范围：仅限微信、支付宝的支付成功、收款成功与账单详情页。\n提取字段：仅结构化金额、商户名、方式、时间、脱敏商品名与哈希订单号；绝不上传转账备注原文，绝不读聊天或密码页，无手势点击权限。\n存储与关闭：纯离线仅存本机，不上传任何账单内容，随时可在系统无障碍中关闭。若部分支付页因系统安全策略受限未能读取，属正常保护行为，仍可继续使用通知监听自动记账。"
                 android:textColor="@color/text_muted"
                 android:textSize="12sp" />
 
@@ -243,43 +300,6 @@
                 android:text="Android 13+ 开关灰掉？直达应用详情 →"
                 android:textSize="11sp"
                 android:visibility="gone" />
-        </LinearLayout>
-
-        <!-- 条件提示卡：Android 13–15 侧载受限设置 -->
-        <LinearLayout
-            android:id="@+id/cardRestrictedHint"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginBottom="8dp"
-            android:background="@color/status_warn_bg"
-            android:orientation="vertical"
-            android:padding="10dp"
-            android:visibility="gone">
-
-            <TextView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:text="Android 13–15 侧载遇到「受限设置」灰掉怎么办？"
-                android:textColor="@color/status_warn_text"
-                android:textSize="12sp"
-                android:textStyle="bold" />
-
-            <TextView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="3dp"
-                android:text="先在上方开关点一次触发提示 → 点下方按钮直达应用详情 → 右上角 ⋮ 点「允许受限设置」→ 返回即可打开。"
-                android:textColor="@color/text_main"
-                android:textSize="11sp" />
-
-            <Button
-                android:id="@+id/btnOpenAppDetails"
-                style="@style/Widget.MaterialComponents.Button.TextButton"
-                android:layout_width="wrap_content"
-                android:layout_height="34dp"
-                android:layout_gravity="end"
-                android:text="一键直达应用详情 →"
-                android:textSize="12sp" />
         </LinearLayout>
 
         <!-- 极简可验证运行状态 -->

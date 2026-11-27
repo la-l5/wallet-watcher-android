@@ -134,17 +134,19 @@ data class TreeSnapshotResult(
     val texts: List<String>,
     val hasPasswordField: Boolean,
     val truncated: Boolean,
-    val rejectedReason: String? = null
+    val rejectedReason: String? = null,
+    val visitedNodes: Int = 0,
+    val elapsedMs: Long = 0L
 ) {
     val isSafeToParse: Boolean
         get() = rejectedReason == null && !hasPasswordField && !truncated && texts.isNotEmpty()
 }
 
 object AccessibilitySnapshotCollector {
-    const val DEFAULT_BUDGET_NANOS = 50_000_000L // 50ms traversal budget; any overrun discards snapshot
-    const val DEFAULT_MAX_NODES = 600
-    const val DEFAULT_MAX_TEXT_NODES = 200
-    const val DEFAULT_MAX_DEPTH = 36
+    const val DEFAULT_BUDGET_NANOS = 250_000_000L // 250ms traversal budget for real Binder IPC; any overrun discards snapshot
+    const val DEFAULT_MAX_NODES = 2000
+    const val DEFAULT_MAX_TEXT_NODES = 350
+    const val DEFAULT_MAX_DEPTH = 48
     const val DEFAULT_MAX_TEXT_LENGTH = 140
 
     fun collect(
@@ -158,7 +160,8 @@ object AccessibilitySnapshotCollector {
         maxTextNodes: Int = DEFAULT_MAX_TEXT_NODES,
         maxDepth: Int = DEFAULT_MAX_DEPTH
     ): TreeSnapshotResult {
-        val deadlineNanos = nanoTimeProvider() + budgetNanos
+        val startNanos = nanoTimeProvider()
+        val deadlineNanos = startNanos + budgetNanos
 
         if (eventPackage !in ScreenBillParser.ALLOWED_PACKAGES) {
             return TreeSnapshotResult(emptyList(), hasPasswordField = false, truncated = false, rejectedReason = "disallowed_event_package")
@@ -244,9 +247,11 @@ object AccessibilitySnapshotCollector {
         }
 
         traverse(root, 0)
-        if (!truncated && !childReadError && nanoTimeProvider() > deadlineNanos) {
+        val endNanos = nanoTimeProvider()
+        if (!truncated && !childReadError && endNanos > deadlineNanos) {
             truncated = true
         }
+        val elapsedMs = ((endNanos - startNanos).coerceAtLeast(0L)) / 1_000_000L
         val incomplete = hasPassword || truncated || childReadError
         return TreeSnapshotResult(
             texts = if (incomplete) emptyList() else texts,
@@ -257,7 +262,9 @@ object AccessibilitySnapshotCollector {
                 childReadError -> "child_read_error"
                 truncated -> "budget_truncated"
                 else -> null
-            }
+            },
+            visitedNodes = visitedNodes,
+            elapsedMs = elapsedMs
         )
     }
 }
