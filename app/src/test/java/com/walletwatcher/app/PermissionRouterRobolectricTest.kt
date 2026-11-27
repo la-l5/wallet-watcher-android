@@ -223,4 +223,26 @@ class PermissionRouterRobolectricTest {
         assertFalse("Unknown-windowId ROM fallback must still block ChattingUI", unknownWinBlocked)
         assertEquals(1, acceptedCount)
     }
+
+    @Test
+    fun updaterFileProviderAndUnknownSourcesIntentsWorkForUpdatesCacheDir() {
+        val unknownIntent = com.walletwatcher.app.core.AppUpdater.buildUnknownAppSourcesIntent(context)
+        assertEquals(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, unknownIntent.action)
+        assertEquals("package:${context.packageName}", unknownIntent.data?.toString())
+
+        val updatesDir = com.walletwatcher.app.core.AppUpdater.getUpdatesCacheDir(context)
+        updatesDir.mkdirs()
+        val fakeApk = java.io.File(updatesDir, com.walletwatcher.app.core.AppUpdater.UPDATE_APK_FILENAME)
+        fakeApk.writeBytes("PK\u0003\u0004dummy".toByteArray())
+        try {
+            val installIntent = com.walletwatcher.app.core.AppUpdater.buildInstallApkIntent(context, fakeApk)
+            assertEquals(android.content.Intent.ACTION_VIEW, installIntent.action)
+            assertEquals("application/vnd.android.package-archive", installIntent.type)
+            assertEquals("content", installIntent.data?.scheme)
+            assertEquals("${context.packageName}.fileprovider", installIntent.data?.authority)
+            assertTrue((installIntent.flags and android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION) != 0)
+        } finally {
+            fakeApk.delete()
+        }
+    }
 }

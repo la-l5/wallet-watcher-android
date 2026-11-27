@@ -108,5 +108,28 @@
                 android:textSize="12sp" />
         </LinearLayout>
 
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="14dp"
+            android:text="四、版本与手动检查更新（仅点击时联网，默认零后台请求）"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/tvAppVersionInfo"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="当前版本"
+            android:textSize="12sp" />
+
+        <Button
+            android:id="@+id/btnCheckUpdate"
+            android:layout_width="match_parent"
+            android:layout_height="40dp"
+            android:layout_marginTop="6dp"
+            android:text="手动检查 GitHub 新版本（SHA-256 校验安装）"
+            android:textSize="12sp" />
+
     </LinearLayout>
 </ScrollView>

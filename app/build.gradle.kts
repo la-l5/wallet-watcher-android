@@ -1,3 +1,4 @@
+import java.util.Locale
 import java.util.Properties
 
 plugins {
@@ -10,6 +11,12 @@ val localProps = Properties().apply {
     if (f.exists()) f.inputStream().use { load(it) }
 }
 
+val versionProps = Properties().apply {
+    val f = rootProject.file("version.properties")
+    check(f.exists()) { "Missing required version.properties at repository root" }
+    f.inputStream().use { load(it) }
+}
+
 fun propOrEnv(name: String, fallback: String = ""): String {
     return System.getenv(name)?.takeIf { it.isNotBlank() }
         ?: localProps.getProperty(name)?.takeIf { it.isNotBlank() }
@@ -19,6 +26,37 @@ fun propOrEnv(name: String, fallback: String = ""): String {
 fun quoted(value: String): String {
     val escaped = value.replace("\\", "\\\\").replace("\"", "\\\"")
     return "\"$escaped\""
+}
+
+val strictSemVerRegex = Regex("""^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$""")
+val sha256HexRegex = Regex("""^[0-9a-f]{64}$""")
+
+val rawVersionCode = propOrEnv("APP_VERSION_CODE").ifBlank {
+    versionProps.getProperty("VERSION_CODE")?.trim().orEmpty()
+}
+val appVersionCode = rawVersionCode.toIntOrNull()?.takeIf { it > 0 }
+    ?: error("Invalid or missing versionCode ('$rawVersionCode'): must be a positive integer")
+
+val appVersionName = propOrEnv("APP_VERSION_NAME").ifBlank {
+    versionProps.getProperty("VERSION_NAME")?.trim().orEmpty()
+}.also {
+    check(strictSemVerRegex.matches(it)) {
+        "Invalid or missing versionName ('$it'): must match SemVer (e.g. 0.2.0-beta.2)"
+    }
+}
+
+val rawReleaseCertSha256 = versionProps.getProperty("RELEASE_CERT_SHA256")?.trim().orEmpty()
+val trustedReleaseCertSha256 = if (rawReleaseCertSha256.isBlank()) {
+    ""
+} else {
+    rawReleaseCertSha256.split(',')
+        .map { entry -> entry.replace(":", "").filterNot { ch -> ch.isWhitespace() }.lowercase(Locale.US) }
+        .also { list ->
+            check(list.isNotEmpty() && list.all { sha256HexRegex.matches(it) }) {
+                "Invalid RELEASE_CERT_SHA256 in version.properties: each entry must be a 64-hex SHA-256 certificate fingerprint"
+            }
+        }
+        .joinToString(",")
 }
 
 val releaseKeystorePath = propOrEnv("RELEASE_KEYSTORE_PATH")
@@ -38,13 +76,15 @@ android {
         applicationId = "com.walletwatcher.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "0.2.0-beta.1"
+        versionCode = appVersionCode
+        versionName = appVersionName
 
         // Public open-source builds never bake an author API key into the APK.
         buildConfigField("String", "DEFAULT_AI_BASE_URL", quoted("https://api.deepseek.com"))
         buildConfigField("String", "DEFAULT_AI_MODEL", quoted("deepseek-chat"))
         buildConfigField("String", "DEFAULT_AI_API_KEY", quoted(""))
+        buildConfigField("String", "GITHUB_REPO", quoted("la-l5/wallet-watcher-android"))
+        buildConfigField("String", "TRUSTED_RELEASE_CERT_SHA256", quoted(trustedReleaseCertSha256))
     }
 
     signingConfigs {

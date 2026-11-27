@@ -31,16 +31,23 @@ import com.walletwatcher.app.BuildConfig
 import com.walletwatcher.app.R
 import com.walletwatcher.app.WalletApp
 import com.walletwatcher.app.core.AiConfig
+import com.walletwatcher.app.core.ApkInstallPreflight
+import com.walletwatcher.app.core.AppUpdater
 import com.walletwatcher.app.core.MoneyMath
 import com.walletwatcher.app.core.RawNotification
+import com.walletwatcher.app.core.ReleaseUpdateInfo
 import com.walletwatcher.app.core.ScreenBillParser
 import com.walletwatcher.app.core.Transaction
 import com.walletwatcher.app.core.TxDirection
 import com.walletwatcher.app.core.TxStatus
+import com.walletwatcher.app.core.UpdateCheckResult
 import com.walletwatcher.app.core.UserProfile
+import com.walletwatcher.app.core.VerifiedApkArchive
 import com.walletwatcher.app.service.WalletNotificationListenerService
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
@@ -78,6 +85,8 @@ class MainActivity : AppCompatActivity() {
     private val screenScope = kotlinx.coroutines.CoroutineScope(screenJob + Dispatchers.IO)
 
     private var pendingBackupPassword: CharArray? = null
+    private var updateJob: kotlinx.coroutines.Job? = null
+    private var pendingInstallArchive: VerifiedApkArchive? = null
 
     private val exportBackupLauncher = registerForActivityResult(
         ActivityResultContracts.CreateDocument("application/octet-stream")
@@ -188,6 +197,7 @@ class MainActivity : AppCompatActivity() {
         }
         refreshUi()
         activePipelineRefresher?.invoke()
+        resumePendingApkInstallIfAuthorized()
     }
 
     override fun onDestroy() {
@@ -195,6 +205,8 @@ class MainActivity : AppCompatActivity() {
         app.removeServiceStateListener(serviceStateListener)
         activePipelineRefresher = null
         refreshJob?.cancel()
+        updateJob?.cancel()
+        pendingInstallArchive = null
         screenJob.cancel()
         pendingBackupPassword?.fill('\u0000')
         pendingBackupPassword = null
@@ -675,6 +687,12 @@ class MainActivity : AppCompatActivity() {
         val etApiKey = view.findViewById<EditText>(R.id.etApiKey)
         val btnExportBackup = view.findViewById<Button>(R.id.btnExportBackup)
         val btnRestoreBackup = view.findViewById<Button>(R.id.btnRestoreBackup)
+        val tvAppVersionInfo = view.findViewById<TextView>(R.id.tvAppVersionInfo)
+        val btnCheckUpdate = view.findViewById<Button>(R.id.btnCheckUpdate)
+
+        val buildFlavorLabel = if (BuildConfig.DEBUG) "调试共存版(.debug)" else "正式签名版"
+        tvAppVersionInfo.text = "当前版本：v${BuildConfig.VERSION_NAME} (code ${BuildConfig.VERSION_CODE}) · $buildFlavorLabel\n" +
+            "更新源：GitHub Releases (${BuildConfig.GITHUB_REPO})，下载前强制校验 SHA-256。"
 
         val p = app.engine.profile
         etRealName.setText(p.realName)
@@ -741,7 +759,280 @@ class MainActivity : AppCompatActivity() {
             restoreBackupLauncher.launch(arrayOf("*/*"))
         }
 
+        btnCheckUpdate.setOnClickListener {
+            dialog.dismiss()
+            startManualUpdateCheck()
+        }
+
         dialog.show()
+    }
+
+    private fun startManualUpdateCheck() {
+        if (updateJob?.isActive == true) {
+            Toast.makeText(this, "正在检查或下载更新，请稍候…", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val loadingDialog = AlertDialog.Builder(this)
+            .setTitle("检查更新")
+            .setMessage("正在连接 GitHub Releases（仅手动触发）…")
+            .setNegativeButton("取消") { _, _ -> updateJob?.cancel() }
+            .setCancelable(true)
+            .setOnCancelListener { updateJob?.cancel() }
+            .show()
+
+        updateJob = screenScope.launch {
+            val res = runCatching {
+                AppUpdater.checkForUpdate(currentVersionName = BuildConfig.VERSION_NAME)
+            }
+            res.exceptionOrNull()?.let { if (it is CancellationException) throw it }
+            withContext(Dispatchers.Main) {
+                if (isDestroyed || isFinishing) return@withContext
+                runCatching { loadingDialog.dismiss() }
+                res.onSuccess { outcome ->
+                    when (outcome) {
+                        is UpdateCheckResult.UpdateAvailable -> showUpdateAvailableDialog(outcome.release)
+                        is UpdateCheckResult.UpToDate -> {
+                            AlertDialog.Builder(this@MainActivity)
+                                .setTitle("已是最新版本")
+                                .setMessage("当前版本 v${BuildConfig.VERSION_NAME} 已不低于 GitHub 最新 Release（${outcome.latestTag ?: "-"}）。")
+                                .setPositiveButton("确定", null)
+                                .setNeutralButton("浏览器查看 Releases") { _, _ ->
+                                    openValidatedReleaseBrowser(AppUpdater.RELEASES_PAGE_URL)
+                                }
+                                .show()
+                        }
+                        UpdateCheckResult.NoReleasePublished -> {
+                            AlertDialog.Builder(this@MainActivity)
+                                .setTitle("尚未发布正式 Release")
+                                .setMessage("仓库 ${BuildConfig.GITHUB_REPO} 尚未找到包含 APK 与 checksums.txt 的 GitHub Release。配置好固定 Release 签名并推送 v* 标签后，即可在此一键检查并覆盖更新。")
+                                .setPositiveButton("确定", null)
+                                .setNeutralButton("打开 Releases 页") { _, _ ->
+                                    openValidatedReleaseBrowser(AppUpdater.RELEASES_PAGE_URL)
+                                }
+                                .show()
+                        }
+                    }
+                }.onFailure { err ->
+                    AlertDialog.Builder(this@MainActivity)
+                        .setTitle("检查更新失败")
+                        .setMessage("无法从 GitHub 获取版本信息：${err.message ?: err.javaClass.simpleName}\n\n如当前网络直连 GitHub 受限，可尝试用浏览器打开 Releases 页面下载。")
+                        .setPositiveButton("重试") { _, _ -> startManualUpdateCheck() }
+                        .setNeutralButton("浏览器打开") { _, _ ->
+                            openValidatedReleaseBrowser(AppUpdater.RELEASES_PAGE_URL)
+                        }
+                        .setNegativeButton("关闭", null)
+                        .show()
+                }
+            }
+        }
+    }
+
+    private fun showUpdateAvailableDialog(release: ReleaseUpdateInfo) {
+        val sizeText = if (release.apkSizeBytes > 0L) {
+            String.format(Locale.CHINA, "%.2f MB", release.apkSizeBytes / (1024.0 * 1024.0))
+        } else {
+            "未知大小"
+        }
+        val canInstallInApp = AppUpdater.canInstallReleaseFromBuild(
+            isDebugBuild = BuildConfig.DEBUG,
+            trustedReleaseCertSha256Raw = BuildConfig.TRUSTED_RELEASE_CERT_SHA256
+        )
+        val buildNotice = when {
+            !BuildConfig.DEBUG -> {
+                "\n\n提示：将自动核对 checksums.txt 中的 SHA-256 与签名证书，验证通过后再拉起系统安装器保留数据覆盖更新。"
+            }
+            canInstallInApp -> {
+                "\n\n提示：当前安装的是调试版（.debug），下载后会严格校验 SHA-256 与官方正式签名证书指纹，验证通过后作为独立正式应用安装共存（建议先导出加密备份）。"
+            }
+            else -> {
+                "\n\n提示：当前调试版未内置官方正式签名证书指纹，为保证首次安装身份可信，应用内下载安装已禁用。请点击「浏览器打开发行页」核对 checksums.txt 与签名指纹后手动下载安装正式版。"
+            }
+        }
+        val notesPreview = if (release.notes.isNotBlank()) {
+            "\n\n更新说明：\n${release.notes.take(450)}"
+        } else {
+            ""
+        }
+        val builder = AlertDialog.Builder(this)
+            .setTitle("发现新版本：${release.tagName}")
+            .setMessage("当前版本：v${BuildConfig.VERSION_NAME}\n最新版本：${release.tagName}（$sizeText）$buildNotice$notesPreview")
+            .setNegativeButton("稍后", null)
+        if (canInstallInApp) {
+            builder.setPositiveButton("下载并校验安装") { _, _ ->
+                startDownloadAndVerifyUpdate(release)
+            }
+            builder.setNeutralButton("浏览器打开") { _, _ ->
+                openValidatedReleaseBrowser(release.htmlUrl)
+            }
+        } else {
+            builder.setPositiveButton("浏览器打开发行页") { _, _ ->
+                openValidatedReleaseBrowser(release.htmlUrl)
+            }
+        }
+        builder.show()
+    }
+
+    private fun startDownloadAndVerifyUpdate(release: ReleaseUpdateInfo) {
+        if (updateJob?.isActive == true) return
+        val progressView = TextView(this).apply {
+            setPadding(48, 32, 48, 16)
+            text = "正在获取 checksums.txt 并下载 ${release.apkAssetName}…"
+        }
+        val progressDialog = AlertDialog.Builder(this)
+            .setTitle("正在下载并校验 ${release.tagName}")
+            .setView(progressView)
+            .setNegativeButton("取消") { _, _ -> updateJob?.cancel() }
+            .setCancelable(false)
+            .show()
+
+        var lastUiUpdateMs = 0L
+        updateJob = screenScope.launch {
+            val res = runCatching {
+                val targetDir = AppUpdater.getUpdatesCacheDir(this@MainActivity)
+                val (apkFile, sha256) = AppUpdater.downloadAndVerifyApk(
+                    release = release,
+                    targetDir = targetDir,
+                    userAgentVersion = BuildConfig.VERSION_NAME,
+                    shouldCancel = { !isActive }
+                ) { downloaded, total ->
+                    val now = System.currentTimeMillis()
+                    if (now - lastUiUpdateMs >= 180L || (total > 0L && downloaded >= total)) {
+                        lastUiUpdateMs = now
+                        val msg = if (total > 0L) {
+                            val pct = ((downloaded * 100L) / total).coerceIn(0L, 100L)
+                            "已下载 ${downloaded / 1024} KB / ${total / 1024} KB（$pct%），完成后自动校验 SHA-256…"
+                        } else {
+                            "已下载 ${downloaded / 1024} KB，完成后自动校验 SHA-256…"
+                        }
+                        runOnUiThread {
+                            if (!isDestroyed && !isFinishing) progressView.text = msg
+                        }
+                    }
+                }
+                val (archive, preflight) = try {
+                    val inspected = AppUpdater.inspectApkArchive(this@MainActivity, apkFile, sha256)
+                    val installedCode = AppUpdater.getInstalledVersionCode(this@MainActivity)
+                        .takeIf { it > 0L } ?: BuildConfig.VERSION_CODE.toLong()
+                    val check = AppUpdater.evaluateInstallPreflight(
+                        installedPackageName = packageName,
+                        installedVersionCode = installedCode,
+                        installedSigningCertSha256s = AppUpdater.getInstalledSigningCertSha256s(this@MainActivity),
+                        archive = inspected,
+                        trustedReleaseCertSha256s = AppUpdater.parseTrustedCertFingerprints(
+                            BuildConfig.TRUSTED_RELEASE_CERT_SHA256
+                        )
+                    )
+                    if (check is ApkInstallPreflight.Blocked) {
+                        runCatching { apkFile.delete() }
+                    }
+                    inspected to check
+                } catch (t: Throwable) {
+                    runCatching { apkFile.delete() }
+                    throw t
+                }
+                archive to preflight
+            }
+            if (!isActive) return@launch
+            res.exceptionOrNull()?.let { if (it is CancellationException) throw it }
+
+            withContext(Dispatchers.Main) {
+                if (isDestroyed || isFinishing) return@withContext
+                runCatching { progressDialog.dismiss() }
+                res.onSuccess { (archive, preflight) ->
+                    when (preflight) {
+                        is ApkInstallPreflight.Blocked -> {
+                            AlertDialog.Builder(this@MainActivity)
+                                .setTitle("已阻止安装")
+                                .setMessage(preflight.reason)
+                                .setPositiveButton("知道了", null)
+                                .show()
+                        }
+                        is ApkInstallPreflight.ReadyToInstall -> {
+                            launchOrRequestInstallPermission(archive)
+                        }
+                    }
+                }.onFailure { err ->
+                    AlertDialog.Builder(this@MainActivity)
+                        .setTitle("下载或校验失败")
+                        .setMessage("${err.message ?: err.javaClass.simpleName}\n\n可改用浏览器手动打开 GitHub Releases 下载核对。")
+                        .setPositiveButton("浏览器打开") { _, _ ->
+                            openValidatedReleaseBrowser(release.htmlUrl)
+                        }
+                        .setNegativeButton("关闭", null)
+                        .show()
+                }
+            }
+        }
+    }
+
+    private fun launchOrRequestInstallPermission(archive: VerifiedApkArchive) {
+        if (!AppUpdater.canRequestPackageInstalls(this)) {
+            pendingInstallArchive = archive
+            AlertDialog.Builder(this)
+                .setTitle("需要允许安装应用更新")
+                .setMessage("安装包已通过 SHA-256 校验（${archive.sha256Hex.take(12)}…）。首次在应用内更新需在系统设置中开启「允许来自此来源的应用」，开启后返回即可继续安装。")
+                .setPositiveButton("前往开启") { _, _ ->
+                    runCatching { startActivity(AppUpdater.buildUnknownAppSourcesIntent(this)) }
+                        .onFailure {
+                            Toast.makeText(this, "无法打开安装权限设置，请在系统设置中手动授权", Toast.LENGTH_LONG).show()
+                        }
+                }
+                .setNegativeButton("取消") { _, _ ->
+                    pendingInstallArchive = null
+                }
+                .show()
+            return
+        }
+        pendingInstallArchive = null
+        launchVerifiedApkInstaller(archive)
+    }
+
+    private fun resumePendingApkInstallIfAuthorized() {
+        val pending = pendingInstallArchive ?: return
+        if (!AppUpdater.canRequestPackageInstalls(this)) return
+        pendingInstallArchive = null
+        screenScope.launch {
+            val valid = runCatching {
+                val updatesDir = AppUpdater.getUpdatesCacheDir(this@MainActivity).canonicalFile
+                val canonicalFile = pending.file.canonicalFile
+                if (!canonicalFile.isFile || canonicalFile.parentFile != updatesDir) {
+                    false
+                } else {
+                    val recomputed = AppUpdater.computeFileSha256(canonicalFile).lowercase(Locale.US)
+                    java.security.MessageDigest.isEqual(
+                        recomputed.toByteArray(Charsets.US_ASCII),
+                        pending.sha256Hex.lowercase(Locale.US).toByteArray(Charsets.US_ASCII)
+                    )
+                }
+            }.getOrDefault(false)
+            withContext(Dispatchers.Main) {
+                if (isDestroyed || isFinishing) return@withContext
+                if (valid) {
+                    launchVerifiedApkInstaller(pending)
+                } else {
+                    runCatching { pending.file.delete() }
+                    Toast.makeText(this@MainActivity, "待安装缓存文件已失效，请重新检查更新", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
+    private fun launchVerifiedApkInstaller(archive: VerifiedApkArchive) {
+        runCatching {
+            val intent = AppUpdater.buildInstallApkIntent(this, archive.file)
+            startActivity(intent)
+        }.onFailure { err ->
+            Toast.makeText(this, "无法拉起系统安装器：${err.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun openValidatedReleaseBrowser(url: String) {
+        val safeUrl = if (AppUpdater.isAllowedReleaseHtmlUrl(url)) url else AppUpdater.RELEASES_PAGE_URL
+        runCatching {
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(safeUrl)))
+        }.onFailure {
+            Toast.makeText(this, "未找到可用浏览器打开更新页面", Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun promptPasswordDialog(title: String, hint: String, onConfirm: (CharArray) -> Unit) {

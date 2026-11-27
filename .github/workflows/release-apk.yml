@@ -5,11 +5,31 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      version_name:
+        description: 'Optional SemVer override for manual dry-run (e.g. 0.2.0-beta.2)'
+        required: false
+        default: ''
+      version_code:
+        description: 'Optional positive integer versionCode override for manual dry-run'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+# Fixed repository-wide concurrency group serializes ALL release checks, builds, and publishes
+# so two concurrent tag pushes can never read the same prior versionCode and race past the guard.
+concurrency:
+  group: wallet-watcher-release-publish
+  cancel-in-progress: false
 
 jobs:
   release:
     runs-on: ubuntu-latest
     environment: release
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repository
@@ -33,6 +53,127 @@ jobs:
             yes | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
           fi
 
+      - name: Resolve and Strictly Validate Release Version Metadata
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION_NAME: ${{ inputs.version_name }}
+          INPUT_VERSION_CODE: ${{ inputs.version_code }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, subprocess, sys
+
+          SEMVER_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$")
+          CODE_RE = re.compile(r"^[1-9][0-9]{0,8}$")
+          SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+          props = {}
+          with open("version.properties", encoding="utf-8") as f:
+              for raw in f:
+                  line = raw.strip()
+                  if not line or line.startswith("#") or "=" not in line:
+                      continue
+                  k, v = line.split("=", 1)
+                  props[k.strip()] = v.strip()
+
+          prop_name = props.get("VERSION_NAME", "")
+          prop_code = props.get("VERSION_CODE", "")
+          prop_cert_raw = props.get("RELEASE_CERT_SHA256", "").strip()
+          if not SEMVER_RE.fullmatch(prop_name):
+              sys.exit(f"::error::Invalid VERSION_NAME in version.properties: {prop_name!r}")
+          if not CODE_RE.fullmatch(prop_code):
+              sys.exit(f"::error::Invalid VERSION_CODE in version.properties: {prop_code!r}")
+
+          normalized_certs = []
+          if prop_cert_raw:
+              for entry in prop_cert_raw.split(","):
+                  cleaned = re.sub(r"[:\s]+", "", entry).lower()
+                  if not SHA256_RE.fullmatch(cleaned):
+                      sys.exit(f"::error::Invalid RELEASE_CERT_SHA256 entry in version.properties: {entry!r}")
+                  normalized_certs.append(cleaned)
+          expected_cert_csv = ",".join(normalized_certs)
+
+          ref_type = os.environ.get("REF_TYPE", "")
+          ref_name = os.environ.get("REF_NAME", "")
+          in_name = os.environ.get("INPUT_VERSION_NAME", "").strip()
+          in_code = os.environ.get("INPUT_VERSION_CODE", "").strip()
+
+          if ref_type == "tag":
+              if not ref_name.startswith("v"):
+                  sys.exit(f"::error::Release tag must start with 'v': {ref_name!r}")
+              tag_ver = ref_name[1:]
+              if not SEMVER_RE.fullmatch(tag_ver):
+                  sys.exit(f"::error::Release tag is not valid SemVer: {ref_name!r}")
+              if tag_ver != prop_name:
+                  sys.exit(
+                      f"::error::Tag version ({tag_ver}) does not match version.properties VERSION_NAME ({prop_name}). "
+                      "Update version.properties (VERSION_NAME and monotonic VERSION_CODE) before tagging."
+                  )
+              final_tag = ref_name
+              final_name = prop_name
+              final_code = prop_code
+
+              # Enforce strictly monotonic VERSION_CODE across ALL previously published GitHub Releases (paginated, fail-closed)
+              repo = os.environ["REPO"]
+              proc = subprocess.run(
+                  ["gh", "api", "--paginate", "--slurp", f"repos/{repo}/releases?per_page=100"],
+                  capture_output=True,
+                  text=True,
+                  check=False,
+              )
+              if proc.returncode != 0:
+                  sys.exit(f"::error::Failed to query prior GitHub Releases for versionCode check: {proc.stderr.strip()}")
+              raw_pages = json.loads(proc.stdout or "[]")
+              releases = []
+              for item in raw_pages:
+                  if isinstance(item, list):
+                      releases.extend(item)
+                  elif isinstance(item, dict):
+                      releases.append(item)
+              max_prev_code = 0
+              max_prev_tag = ""
+              for rel in releases:
+                  if rel.get("draft"):
+                      continue
+                  rtag = (rel.get("tag_name") or "").strip()
+                  if rtag == final_tag:
+                      continue
+                  body = rel.get("body") or ""
+                  m = re.search(r"(?m)^Version Code:\s*([1-9][0-9]{0,8})\s*$", body)
+                  if not m:
+                      sys.exit(
+                          f"::error::Prior published release {rtag!r} is missing a valid 'Version Code: <N>' line in its notes; "
+                          "refusing to publish blindly without monotonic versionCode proof."
+                      )
+                  c = int(m.group(1))
+                  if c > max_prev_code:
+                      max_prev_code = c
+                      max_prev_tag = rtag
+              if int(final_code) <= max_prev_code:
+                  sys.exit(
+                      f"::error::VERSION_CODE ({final_code}) must be strictly greater than previously released "
+                      f"Version Code ({max_prev_code} from {max_prev_tag}). Bump VERSION_CODE in version.properties first."
+                  )
+          else:
+              final_tag = ""
+              final_name = in_name if in_name else prop_name
+              final_code = in_code if in_code else prop_code
+              if not SEMVER_RE.fullmatch(final_name):
+                  sys.exit(f"::error::Invalid workflow_dispatch version_name: {final_name!r}")
+              if not CODE_RE.fullmatch(final_code):
+                  sys.exit(f"::error::Invalid workflow_dispatch version_code: {final_code!r}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"tag={final_tag}\n")
+              out.write(f"version_name={final_name}\n")
+              out.write(f"version_code={final_code}\n")
+              out.write(f"expected_cert_sha256={expected_cert_csv}\n")
+          print(f"Validated Release Version -> tag={final_tag or '<dispatch>'}, versionName={final_name}, versionCode={final_code}, pinnedCerts={len(normalized_certs)}")
+          PY
+
       - name: Run Unit & SQLite Tests Before Release
         run: gradle testDebugUnitTest --stacktrace
 
@@ -46,38 +187,97 @@ jobs:
           fi
           printf '%s' "${RELEASE_KEYSTORE_BASE64}" | base64 --decode > "${RUNNER_TEMP}/release.jks"
 
-      - name: Build Signed Release APK
+      - name: Build Signed Release APK & Verify Version Metadata and Zero Baked Keys
         env:
+          APP_VERSION_NAME: ${{ steps.ver.outputs.version_name }}
+          APP_VERSION_CODE: ${{ steps.ver.outputs.version_code }}
+          EXPECTED_CERT_SHA256: ${{ steps.ver.outputs.expected_cert_sha256 }}
           RELEASE_KEYSTORE_PATH: ${{ runner.temp }}/release.jks
           RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
           RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
           RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
         run: |
+          set -euo pipefail
           gradle assembleRelease --no-build-cache --no-configuration-cache
           APK="app/build/outputs/apk/release/app-release.apk"
           test -f "${APK}"
+          AAPT2="$(find "${ANDROID_HOME}/build-tools" -name aapt2 2>/dev/null | sort -V | tail -n 1)"
+          test -n "${AAPT2}"
+          BADGING="$("${AAPT2}" dump badging "${APK}")"
+          echo "${BADGING}" | head -n 3
+          BADGING_LINE="$(echo "${BADGING}" | grep -m1 '^package:')"
+          export BADGING_LINE
+          python3 - <<'PY'
+          import os, re, sys, zipfile
+
+          line = os.environ.get("BADGING_LINE", "")
+          expected_name = os.environ["APP_VERSION_NAME"]
+          expected_code = os.environ["APP_VERSION_CODE"]
+          m_pkg = re.search(r"name='([^']+)'", line)
+          m_code = re.search(r"versionCode='([^']+)'", line)
+          m_ver = re.search(r"versionName='([^']+)'", line)
+          if not (m_pkg and m_code and m_ver):
+              sys.exit(f"::error::Failed to parse aapt2 badging package line: {line!r}")
+          if m_pkg.group(1) != "com.walletwatcher.app":
+              sys.exit(f"::error::Unexpected Release packageName: {m_pkg.group(1)!r}")
+          if m_code.group(1) != expected_code:
+              sys.exit(f"::error::Built APK versionCode ({m_code.group(1)}) != expected ({expected_code})")
+          if m_ver.group(1) != expected_name:
+              sys.exit(f"::error::Built APK versionName ({m_ver.group(1)}) != expected ({expected_name})")
+
+          apk_path = "app/build/outputs/apk/release/app-release.apk"
+          key_pattern = re.compile(rb"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9]{20,}")
+          with zipfile.ZipFile(apk_path) as apk:
+              dex_blobs = [apk.read(n) for n in apk.namelist() if n.endswith(".dex")]
+              assert dex_blobs, "No DEX files found in Release APK"
+              assert not any(key_pattern.search(blob) for blob in dex_blobs), "Unexpected API key pattern found in Release DEX"
+          print(f"Verified built APK: pkg=com.walletwatcher.app versionCode={expected_code} versionName={expected_name}, DEX zero-key passed.")
+          PY
           mkdir -p release-dist
           cp "${APK}" release-dist/wallet-watcher-release.apk
+          APKSIGNER="$(find "${ANDROID_HOME}/build-tools" -name apksigner 2>/dev/null | sort -V | tail -n 1)"
+          test -n "${APKSIGNER}"
+          CERT_INFO="$("${APKSIGNER}" verify --print-certs release-dist/wallet-watcher-release.apk)"
+          export CERT_INFO
+          python3 - <<'PY'
+          import os, re, sys
+
+          cert_info = os.environ.get("CERT_INFO", "")
+          digests = [m.lower() for m in re.findall(r"certificate SHA-256 digest:\s*([0-9a-fA-F]{64})", cert_info)]
+          if not digests:
+              sys.exit(f"::error::Failed to extract signing certificate SHA-256 from apksigner output:\n{cert_info}")
+          expected_raw = os.environ.get("EXPECTED_CERT_SHA256", "").strip()
+          if expected_raw:
+              allowed = {x.strip().lower() for x in expected_raw.split(",") if x.strip()}
+              if not any(d in allowed for d in digests):
+                  sys.exit(
+                      f"::error::Built APK signing cert SHA-256 ({digests}) does not match RELEASE_CERT_SHA256 in version.properties ({sorted(allowed)})."
+                  )
+              print(f"Verified APK signing certificate SHA-256 matches version.properties: {digests}")
+          else:
+              print(
+                  f"::notice::RELEASE_CERT_SHA256 is blank in version.properties. "
+                  f"To enable verified Debug->Release first install, commit: RELEASE_CERT_SHA256={digests[0]}"
+              )
+          PY
           {
             echo "# Wallet Watcher Release Checksums"
             echo ""
+            echo "Version Name: ${APP_VERSION_NAME}"
+            echo "Version Code: ${APP_VERSION_CODE}"
+            echo ""
             echo "## APK File SHA-256 (verify download integrity)"
-            sha256sum release-dist/wallet-watcher-release.apk
+            (cd release-dist && sha256sum wallet-watcher-release.apk)
             echo ""
             echo "## APK Signing Certificate SHA-256 Fingerprint (verify publisher identity)"
-            APKSIGNER="$(find "${ANDROID_HOME}/build-tools" -name apksigner 2>/dev/null | sort -V | tail -n 1)"
-            if [ -n "${APKSIGNER}" ]; then
-              "${APKSIGNER}" verify --print-certs release-dist/wallet-watcher-release.apk
-            else
-              keytool -printcert -jarfile release-dist/wallet-watcher-release.apk
-            fi
+            printf '%s\n' "${CERT_INFO}"
           } | tee release-dist/checksums.txt
 
       - name: Clean Up Keystore
         if: always()
         run: rm -f "${RUNNER_TEMP}/release.jks"
 
-      - name: Upload Signed Release Bundle
+      - name: Upload Signed Release Bundle Artifact
         uses: actions/upload-artifact@v4
         with:
           name: wallet-watcher-release-apk
@@ -85,3 +285,28 @@ jobs:
             release-dist/wallet-watcher-release.apk
             release-dist/checksums.txt
           if-no-files-found: error
+
+      - name: Publish GitHub Release (on v* tag push)
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" \
+              release-dist/wallet-watcher-release.apk \
+              release-dist/checksums.txt \
+              --clobber
+          else
+            ARGS=(
+              release create "${TAG}"
+              release-dist/wallet-watcher-release.apk
+              release-dist/checksums.txt
+              --title "Wallet Watcher ${TAG}"
+              --notes-file release-dist/checksums.txt
+            )
+            if [[ "${TAG}" == *-* ]]; then
+              ARGS+=(--prerelease)
+            fi
+            gh "${ARGS[@]}"
+          fi
