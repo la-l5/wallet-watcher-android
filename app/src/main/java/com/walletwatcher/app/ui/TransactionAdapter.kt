@@ -88,7 +88,11 @@ class TransactionAdapter(
         val rescueTag = if (tx.rescuedByUser) " · 已捞回" else ""
         holder.tvMeta.text = "${tx.category} · ${tx.paymentMethod} · ${timeFmt.format(Date(tx.occurredAtMs))}$settlementTag$mergedTag$rescueTag"
 
-        val reasonPrefix = if (isIgnoredTab) "拦截原因：" else "判定(${tx.aiModeUsed})："
+        val reasonPrefix = when {
+            isIgnoredTab -> "拦截原因："
+            tx.aiModeUsed == "local" -> "本地判定："
+            else -> "判定(${tx.aiModeUsed})："
+        }
         val reasonBody = if (isIgnoredTab) tx.ignoreReason.ifBlank { tx.aiReasoning } else "${tx.itemSummary}（${tx.aiReasoning}）"
         holder.tvReason.visibility = View.VISIBLE
         holder.tvReason.text = "$reasonPrefix$reasonBody"

@@ -221,7 +221,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="4dp"
-                android:text="读取范围：仅限微信、支付宝的支付成功、收款成功与账单详情页。\n提取字段：仅结构化金额、商户名、方式、时间、脱敏商品名与哈希订单号；绝不上传转账备注原文，绝不读聊天或密码页，无手势点击权限。\n存储与关闭：默认纯离线仅存本机（开启自有 AI 时仅发脱敏结构化摘要），随时可在系统无障碍中关闭。"
+                android:text="读取范围：仅限微信、支付宝的支付成功、收款成功与账单详情页。\n提取字段：仅结构化金额、商户名、方式、时间、脱敏商品名与哈希订单号；绝不上传转账备注原文，绝不读聊天或密码页，无手势点击权限。\n存储与关闭：纯离线仅存本机，不上传任何账单内容，随时可在系统无障碍中关闭。"
                 android:textColor="@color/text_muted"
                 android:textSize="12sp" />
 

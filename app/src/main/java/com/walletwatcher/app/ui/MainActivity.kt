@@ -15,7 +15,6 @@ import android.text.InputType
 import android.view.LayoutInflater
 import android.view.View
 import android.widget.Button
-import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -105,7 +104,7 @@ class MainActivity : AppCompatActivity() {
                 withContext(Dispatchers.Main) {
                     Toast.makeText(
                         this@MainActivity,
-                        "加密备份已导出（${encrypted.size / 1024}KB，不含 API Key）",
+                        "加密备份已导出（${encrypted.size / 1024}KB）",
                         Toast.LENGTH_LONG
                     ).show()
                 }
@@ -314,9 +313,8 @@ class MainActivity : AppCompatActivity() {
             screenEnabled -> "屏幕已开"
             else -> "屏幕关(可选)"
         }
-        val netText = if (app.checkNetworkAvailable()) "在线" else "离线"
         val bufCount = app.engine.activeBufferCount()
-        tvServiceStatus.text = "$connText · $screenText | $netText | ${app.engine.aiConfig.displayLabel}" +
+        tvServiceStatus.text = "$connText · $screenText | ${app.engine.aiConfig.displayLabel}" +
             if (bufCount > 0) " | 缓冲($bufCount)" else ""
 
         val coreReadyCount = (if (notifGranted) 1 else 0) + (if (batteryExempt) 1 else 0)
@@ -681,10 +679,6 @@ class MainActivity : AppCompatActivity() {
         val etAliases = view.findViewById<EditText>(R.id.etAliases)
         val etCardTails = view.findViewById<EditText>(R.id.etCardTails)
         val etBrokers = view.findViewById<EditText>(R.id.etBrokers)
-        val cbUseRealApi = view.findViewById<CheckBox>(R.id.cbUseRealApi)
-        val etBaseUrl = view.findViewById<EditText>(R.id.etBaseUrl)
-        val etModel = view.findViewById<EditText>(R.id.etModel)
-        val etApiKey = view.findViewById<EditText>(R.id.etApiKey)
         val btnExportBackup = view.findViewById<Button>(R.id.btnExportBackup)
         val btnRestoreBackup = view.findViewById<Button>(R.id.btnRestoreBackup)
         val tvAppVersionInfo = view.findViewById<TextView>(R.id.tvAppVersionInfo)
@@ -700,14 +694,8 @@ class MainActivity : AppCompatActivity() {
         etCardTails.setText(p.ownCardTails.joinToString(","))
         etBrokers.setText(p.brokers.joinToString(","))
 
-        val ai = app.engine.aiConfig
-        cbUseRealApi.isChecked = ai.mode == AiConfig.MODE_OPENAI_COMPATIBLE
-        etBaseUrl.setText(ai.baseUrl)
-        etModel.setText(ai.model)
-        etApiKey.setText(ai.apiKey)
-
         val dialog = AlertDialog.Builder(this)
-            .setTitle("档案、离线/AI 与加密备份")
+            .setTitle("档案、备份与更新")
             .setView(view)
             .setPositiveButton("保存") { _, _ ->
                 fun splitCsv(s: String) = s.split(',', '，').map { it.trim() }.filter { it.isNotEmpty() }
@@ -717,24 +705,18 @@ class MainActivity : AppCompatActivity() {
                     ownCardTails = splitCsv(etCardTails.text.toString()),
                     brokers = splitCsv(etBrokers.text.toString()).ifEmpty { UserProfile().brokers }
                 )
-                val typedKey = etApiKey.text.toString().trim()
-                val endpoint = etBaseUrl.text.toString().trim().ifEmpty { BuildConfig.DEFAULT_AI_BASE_URL }
-                val newAi = AiConfig(
-                    mode = if (cbUseRealApi.isChecked) AiConfig.MODE_OPENAI_COMPATIBLE else AiConfig.MODE_LOCAL,
-                    baseUrl = endpoint,
-                    model = etModel.text.toString().trim().ifEmpty { BuildConfig.DEFAULT_AI_MODEL },
-                    apiKey = typedKey
-                )
                 app.appScope.launch {
                     app.engine.updateProfile(newProfile)
-                    app.engine.updateAiConfig(newConfig = newAi, persistConfig = newAi)
+                    if (app.engine.aiConfig.mode != AiConfig.MODE_LOCAL) {
+                        val localAi = AiConfig(mode = AiConfig.MODE_LOCAL)
+                        app.engine.updateAiConfig(newConfig = localAi, persistConfig = localAi)
+                    }
                     withContext(Dispatchers.Main) {
-                        val msg = when {
-                            newAi.isMissingApiKey -> "已开启 AI 模式，但 API Key 为空，将暂用本地规则并标记待核对"
-                            newAi.isRealApiEnabled -> "已保存：已启用自有 AI 接口"
-                            else -> "已保存：纯离线本地解析模式（关闭 AI 后零网络请求）"
-                        }
-                        Toast.makeText(this@MainActivity, msg, Toast.LENGTH_SHORT).show()
+                        Toast.makeText(
+                            this@MainActivity,
+                            "已保存：自己人档案已更新（纯离线本地解析）",
+                            Toast.LENGTH_SHORT
+                        ).show()
                     }
                 }
             }
@@ -745,7 +727,7 @@ class MainActivity : AppCompatActivity() {
             dialog.dismiss()
             promptPasswordDialog(
                 title = "设置加密备份密码",
-                hint = "采用 PBKDF2 + AES-256-GCM 加密，不含 API Key，请妥善记住密码"
+                hint = "采用 PBKDF2 + AES-256-GCM 本地加密，请妥善记住密码"
             ) { pwd ->
                 pendingBackupPassword?.fill('\u0000')
                 pendingBackupPassword = pwd

@@ -19,7 +19,7 @@
             android:id="@+id/etRealName"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="本人真实姓名（发给AI前自动替换成[本人姓名]）"
+            android:hint="本人真实姓名（仅存本机，识别本人名下互转）"
             android:inputType="textPersonName" />
 
         <EditText
@@ -43,45 +43,54 @@
             android:hint="常用券商名（逗号分隔，识别银证转账）"
             android:inputType="text" />
 
+        <!-- Optional cloud AI API UI temporarily hidden while running pure-offline beta; core code kept intact -->
+        <LinearLayout
+            android:id="@+id/layoutAiApiSection"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:visibility="gone">
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="14dp"
+                android:text="可选大模型 API（默认纯离线运行，零遥测，不内置作者 Key）"
+                android:textStyle="bold" />
+
+            <CheckBox
+                android:id="@+id/cbUseRealApi"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="启用自有 OpenAI 兼容 API（取消勾选则完全离线零网络请求）" />
+
+            <EditText
+                android:id="@+id/etBaseUrl"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="HTTPS Base URL（默认 https://api.deepseek.com）"
+                android:inputType="textUri" />
+
+            <EditText
+                android:id="@+id/etModel"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="Model 名称（默认 deepseek-chat）"
+                android:inputType="text" />
+
+            <EditText
+                android:id="@+id/etApiKey"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="自有 API Key（仅存本机，不进入加密备份）"
+                android:inputType="textPassword" />
+        </LinearLayout>
+
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="14dp"
-            android:text="二、可选大模型 API（默认纯离线运行，零遥测，不内置作者 Key）"
-            android:textStyle="bold" />
-
-        <CheckBox
-            android:id="@+id/cbUseRealApi"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="启用自有 OpenAI 兼容 API（取消勾选则完全离线零网络请求）" />
-
-        <EditText
-            android:id="@+id/etBaseUrl"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:hint="HTTPS Base URL（默认 https://api.deepseek.com）"
-            android:inputType="textUri" />
-
-        <EditText
-            android:id="@+id/etModel"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:hint="Model 名称（默认 deepseek-chat）"
-            android:inputType="text" />
-
-        <EditText
-            android:id="@+id/etApiKey"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:hint="自有 API Key（仅存本机，不进入加密备份）"
-            android:inputType="textPassword" />
-
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="14dp"
-            android:text="三、加密逻辑快照备份与恢复（AES-256-GCM，不含 API Key）"
+            android:text="二、加密逻辑快照备份与恢复（AES-256-GCM）"
             android:textStyle="bold" />
 
         <LinearLayout
@@ -112,7 +121,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="14dp"
-            android:text="四、版本与手动检查更新（仅点击时联网，默认零后台请求）"
+            android:text="三、版本与手动检查更新（仅点击时联网，默认零后台请求）"
             android:textStyle="bold" />
 
         <TextView
