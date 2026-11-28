@@ -143,7 +143,7 @@ data class TreeSnapshotResult(
 }
 
 object AccessibilitySnapshotCollector {
-    const val DEFAULT_BUDGET_NANOS = 250_000_000L // 250ms traversal budget for real Binder IPC; any overrun discards snapshot
+    const val DEFAULT_BUDGET_NANOS = 450_000_000L // 450ms background-thread traversal budget for real Binder IPC; any overrun discards snapshot
     const val DEFAULT_MAX_NODES = 2000
     const val DEFAULT_MAX_TEXT_NODES = 350
     const val DEFAULT_MAX_DEPTH = 48

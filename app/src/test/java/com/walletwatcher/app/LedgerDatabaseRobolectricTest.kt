@@ -414,4 +414,40 @@ class LedgerDatabaseRobolectricTest {
             db.close()
         }
     }
+
+    @Test
+    fun sqliteMarkAsIgnoredPreservesSourceLinksAndUndoRestoresExpense() {
+        val db = LedgerDatabase(context, freshDbName("mark_ignored"))
+        try {
+            val engine = LedgerEngine(db)
+            val t0 = 1_700_000_000_000L
+            engine.ingestNotification(
+                RawNotification("com.tencent.mm", "微信", "微信支付", "微信支付凭证：向瑞幸咖啡付款15.00元", t0, notificationId = "wx-ign-1")
+            )
+            engine.flushExpired(true)
+
+            val tx = db.listTransactions().single()
+            assertEquals(1, db.listSourcesForTransaction(tx.id).size)
+            assertEquals(1500L, engine.getSummary(t0).byCurrency["CNY"]!!.netPersonalExpenseMinor)
+
+            val ch = engine.markAsIgnored(tx.id, expectedRevision = tx.revision)!!
+            val updated = db.getTransaction(tx.id)!!
+            assertEquals(TxDirection.IGNORED, updated.direction)
+            assertEquals(TxStatus.IGNORED, updated.status)
+            assertEquals(1, db.listSourcesForTransaction(tx.id).size)
+            val sumAfter = engine.getSummary(t0)
+            assertEquals(0L, sumAfter.byCurrency["CNY"]!!.netPersonalExpenseMinor)
+            assertEquals(1, sumAfter.otherIgnoredCount)
+            assertEquals(0, sumAfter.internalTransferCount)
+
+            assertTrue(engine.undoChange(ch.opId))
+            val restored = db.getTransaction(tx.id)!!
+            assertEquals(TxDirection.EXPENSE, restored.direction)
+            assertEquals(TxStatus.RECORDED, restored.status)
+            assertEquals(1, db.listSourcesForTransaction(tx.id).size)
+            assertEquals(1500L, engine.getSummary(t0).byCurrency["CNY"]!!.netPersonalExpenseMinor)
+        } finally {
+            db.close()
+        }
+    }
 }

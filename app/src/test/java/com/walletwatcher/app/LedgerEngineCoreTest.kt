@@ -1617,4 +1617,385 @@ class LedgerEngineCoreTest {
         assertEquals("定制礼盒", tx2.itemSummary)
         assertFalse(tx2.sanitizedText.contains("送给小林"))
     }
+
+    // ==================== Beta.4: Notification Whitelist Gate & Manual Ignore ====================
+
+    @Test
+    fun alipayJobPostingAndBrandNameNonTxNotificationsAreBlocked() {
+        val store = InMemoryLedgerStore()
+        val engine = LedgerEngine(store)
+        val t0 = 1_700_000_000_000L
+
+        val nonTxNotifications = listOf(
+            RawNotification("com.eg.android.AlipayGphone", "支付宝", "支付宝", "向你发来一份岗位信息，薪资4500-4500元/月", t0, notificationId = "job-1"),
+            RawNotification("com.eg.android.AlipayGphone", "支付宝", "支付宝就业", "HR向你发来一份岗位信息：4500元", t0 + 100L, notificationId = "job-2"),
+            RawNotification("com.eg.android.AlipayGphone", "支付宝", "支付宝", "好友向你分享了一份好物清单，仅售4500元", t0 + 200L, notificationId = "brand-only-1"),
+            RawNotification("com.eg.android.AlipayGphone", "支付宝", "支付宝", "恭喜获得50000元可借额度，日利率低至0.02%", t0 + 300L, notificationId = "credit-offer-1"),
+            RawNotification("com.tencent.mm", "微信", "微信支付", "本周账单报告：你共消费128.00元", t0 + 400L, notificationId = "report-1"),
+            RawNotification("com.eg.android.AlipayGphone", "支付宝", "支付宝", "你收到一份岗位信息，4500元，入职即享餐补实付报销", t0 + 500L, notificationId = "job-hard-1"),
+            RawNotification("com.eg.android.AlipayGphone", "支付宝", "支付宝", "消息通知 4500.00元", t0 + 600L, notificationId = "no-verb-1")
+        )
+        for (n in nonTxNotifications) {
+            engine.ingestNotification(n)
+        }
+        engine.flushExpired(true)
+        assertEquals(0, store.listTransactions().size)
+        assertEquals(0, engine.getSummary(t0).recordedCount)
+        assertEquals(0, engine.getSummary(t0).ignoredCount)
+
+        // Genuine Alipay / credit-card transactions (including one mentioning 可用额度) MUST still book accurately
+        engine.ingestNotification(
+            RawNotification("com.eg.android.AlipayGphone", "支付宝", "支付宝", "已支付¥12.50，商户：瑞幸咖啡", t0 + 2_000L, notificationId = "real-ali-1")
+        )
+        engine.ingestNotification(
+            RawNotification("cmb.pb", "招商银行", "动账提醒", "您尾号8841信用卡消费100.00元，当前可用额度19900.00元", t0 + 3_000L, notificationId = "real-cc-1")
+        )
+        engine.ingestNotification(
+            RawNotification("com.eg.android.AlipayGphone", "支付宝", "支付宝", "你已收到¥36.00，来自王凯", t0 + 4_000L, notificationId = "real-ali-in-1")
+        )
+        engine.flushExpired(true)
+
+        val summary = engine.getSummary(t0)
+        assertEquals(3, summary.recordedCount)
+        assertEquals(11250L, summary.byCurrency["CNY"]!!.netPersonalExpenseMinor)
+        assertEquals(3600L, summary.byCurrency["CNY"]!!.totalIncomeMinor)
+    }
+
+    @Test
+    fun salaryRateQuotesAndBrandNamesDoNotPromoteToPaidInAmountExtractor() {
+        val jobExtract = AmountCandidateExtractor.extract("支付宝推荐岗位 4500元")
+        assertNull(jobExtract.primaryCandidate)
+        assertEquals(AmountRole.LIST_PRICE, jobExtract.candidates.single().role)
+
+        val salaryExtract = AmountCandidateExtractor.extract("薪资4500元/月")
+        assertNull(salaryExtract.primaryCandidate)
+        assertEquals(AmountRole.LIST_PRICE, salaryExtract.candidates.single().role)
+
+        val baseSalaryAdExtract = AmountCandidateExtractor.extract("招聘底薪8500元/月")
+        assertNull(baseSalaryAdExtract.primaryCandidate)
+        assertEquals(AmountRole.LIST_PRICE, baseSalaryAdExtract.candidates.single().role)
+
+        val quoteExtract = AmountCandidateExtractor.extract("特价 19.90 元起，限时抢购")
+        assertNull(quoteExtract.primaryCandidate)
+        assertEquals(AmountRole.LIST_PRICE, quoteExtract.candidates.single().role)
+
+        // "起息" must NOT be mistaken for standalone "元起" quote suffix
+        val interestStartExtract = AmountCandidateExtractor.extract("定期转入 10000 元起息")
+        assertEquals(AmountRole.PRINCIPAL, interestStartExtract.primaryCandidate!!.role)
+        assertEquals(1000000L, interestStartExtract.primaryCandidate!!.amountMinor)
+
+        // Completed salary deposits (including memo containing "底薪" or post-amount "已入账") must classify as PRINCIPAL
+        val salaryDepositExtract = AmountCandidateExtractor.extract("您的账户代发薪资入账 8500.00 元")
+        assertEquals(AmountRole.PRINCIPAL, salaryDepositExtract.primaryCandidate!!.role)
+        assertEquals(850000L, salaryDepositExtract.primaryCandidate!!.amountMinor)
+
+        val baseSalaryMemoExtract = AmountCandidateExtractor.extract("您尾号1234的账户已入账8500.00元，摘要：11月底薪")
+        assertEquals(AmountRole.PRINCIPAL, baseSalaryMemoExtract.primaryCandidate!!.role)
+        assertEquals(850000L, baseSalaryMemoExtract.primaryCandidate!!.amountMinor)
+
+        val baseSalarySuffixVerbExtract = AmountCandidateExtractor.extract("您尾号1234的账户11月底薪8500.00元已入账")
+        assertEquals(AmountRole.PRINCIPAL, baseSalarySuffixVerbExtract.primaryCandidate!!.role)
+        assertEquals(850000L, baseSalarySuffixVerbExtract.primaryCandidate!!.amountMinor)
+
+        // Completed payment to a merchant whose name contains "招聘" must still extract primary amount
+        val recruitmentMerchantExtract = AmountCandidateExtractor.extract("付款成功，商户：某某招聘服务中心 100.00 元")
+        assertEquals(10000L, recruitmentMerchantExtract.primaryCandidate!!.amountMinor)
+
+        // Mixed completed charge + next-cycle estimate must strictly select completed amount regardless of clause order
+        val mixedChargeFirst = AmountCandidateExtractor.extract("本次已扣15元，下期预计扣20元")
+        assertEquals(AmountRole.PAID, mixedChargeFirst.primaryCandidate!!.role)
+        assertEquals(1500L, mixedChargeFirst.primaryCandidate!!.amountMinor)
+        assertEquals(AmountRole.INSTALLMENT_DUE, mixedChargeFirst.candidates.first { it.amountMinor == 2000L }.role)
+
+        val mixedEstimateFirst = AmountCandidateExtractor.extract("下期预计扣20元，本次已扣15元")
+        assertEquals(AmountRole.PAID, mixedEstimateFirst.primaryCandidate!!.role)
+        assertEquals(1500L, mixedEstimateFirst.primaryCandidate!!.amountMinor)
+        assertEquals(AmountRole.INSTALLMENT_DUE, mixedEstimateFirst.candidates.first { it.amountMinor == 2000L }.role)
+
+        // Upcoming fee in next-cycle clause MUST be INSTALLMENT_DUE (never FEE), while actual fee stays FEE
+        val upcomingFeeExtract = AmountCandidateExtractor.extract("本次已扣款15元，下期预计扣手续费2元")
+        assertEquals(AmountRole.PAID, upcomingFeeExtract.primaryCandidate!!.role)
+        assertEquals(1500L, upcomingFeeExtract.primaryCandidate!!.amountMinor)
+        assertNull(upcomingFeeExtract.feeCandidate)
+        assertEquals(AmountRole.INSTALLMENT_DUE, upcomingFeeExtract.candidates.first { it.amountMinor == 200L }.role)
+
+        val actualFeeExtract = AmountCandidateExtractor.extract("本次已扣款15元，另收手续费2元")
+        assertEquals(AmountRole.PAID, actualFeeExtract.primaryCandidate!!.role)
+        assertEquals(1500L, actualFeeExtract.primaryCandidate!!.amountMinor)
+        assertEquals(AmountRole.FEE, actualFeeExtract.feeCandidate!!.role)
+        assertEquals(200L, actualFeeExtract.feeCandidate!!.amountMinor)
+
+        val brandOnly = AmountCandidateExtractor.extract("支付宝：向你分享 4500元")
+        assertEquals(AmountRole.UNKNOWN, brandOnly.candidates.single().role)
+
+        val realAliPaid = AmountCandidateExtractor.extract("支付宝：已支付¥19.90")
+        assertEquals(AmountRole.PAID, realAliPaid.primaryCandidate!!.role)
+        assertEquals(1990L, realAliPaid.primaryCandidate!!.amountMinor)
+
+        val realSubCharge = AmountCandidateExtractor.extract("会员自动续费扣款15.00元/月")
+        assertEquals(AmountRole.PAID, realSubCharge.primaryCandidate!!.role)
+        assertEquals(1500L, realSubCharge.primaryCandidate!!.amountMinor)
+    }
+
+    @Test
+    fun salaryDepositAndRecruitmentMerchantBookWhileJobAdsAreBlocked() {
+        val store = InMemoryLedgerStore()
+        val engine = LedgerEngine(store)
+        val t0 = 1_700_000_000_000L
+
+        // Job ads (including 底薪/月薪/薪资) must NOT book
+        engine.ingestNotification(RawNotification("com.eg.android.AlipayGphone", "支付宝", "支付宝", "招聘月薪 8500 元", t0, notificationId = "job-ad-1"))
+        engine.ingestNotification(RawNotification("com.eg.android.AlipayGphone", "支付宝", "支付宝", "招聘：月薪 4500 元，入职享餐补实付报销", t0 + 100L, notificationId = "job-ad-2"))
+        engine.ingestNotification(RawNotification("com.eg.android.AlipayGphone", "支付宝", "支付宝", "HR招聘，薪资 8500 元", t0 + 200L, notificationId = "job-ad-3"))
+        engine.ingestNotification(RawNotification("com.eg.android.AlipayGphone", "支付宝", "支付宝", "招聘底薪8500元/月", t0 + 300L, notificationId = "job-ad-4"))
+        engine.flushExpired(true)
+        assertEquals(0, store.listTransactions().size)
+
+        // Real bank salary deposits containing "薪资" or memo "底薪" MUST book as INCOME
+        engine.ingestNotification(
+            RawNotification("com.android.mms", "短信", "银行通知", "您的账户代发薪资入账 8500.00 元", t0 + 1_000L, "sms", notificationId = "salary-in-1")
+        )
+        engine.ingestNotification(
+            RawNotification("com.android.mms", "短信", "银行通知", "您尾号1234的账户已入账8500.00元，摘要：11月底薪", t0 + 1_500L, "sms", notificationId = "salary-in-2")
+        )
+        // Real payment whose merchant name contains "招聘" MUST book as EXPENSE
+        engine.ingestNotification(
+            RawNotification("com.eg.android.AlipayGphone", "支付宝", "支付宝", "付款成功，商户：某某招聘服务中心 100.00 元", t0 + 2_000L, notificationId = "rec-pay-1")
+        )
+        engine.flushExpired(true)
+
+        val summary = engine.getSummary(t0)
+        assertEquals(3, summary.recordedCount)
+        assertEquals(1700000L, summary.byCurrency["CNY"]!!.totalIncomeMinor)
+        assertEquals(10000L, summary.byCurrency["CNY"]!!.netPersonalExpenseMinor)
+        val txs = store.listTransactions()
+        val incomes = txs.filter { it.direction == TxDirection.INCOME }
+        assertEquals(2, incomes.size)
+        assertTrue(incomes.all { it.category == "工资收入" && it.status == TxStatus.RECORDED })
+        val expense = txs.first { it.direction == TxDirection.EXPENSE }
+        assertEquals("某某招聘服务中心", expense.merchant)
+    }
+
+    @Test
+    fun mixedCompletedChargeAndNextCycleReminderBooksOnlyActualCharge() {
+        val store = InMemoryLedgerStore()
+        val engine = LedgerEngine(store)
+        val t0 = 1_700_000_000_000L
+
+        // Pure comma-separated pending / upcoming reminders without any completed clause must stay blocked
+        engine.ingestNotification(
+            RawNotification("com.eg.android.AlipayGphone", "支付宝", "支付宝", "待付款提醒，向星巴克付款 19.90 元", t0, notificationId = "comma-pending-1")
+        )
+        engine.ingestNotification(
+            RawNotification("com.tencent.mm", "微信", "微信支付", "续费提醒，将于明日自动续费扣款 15.00元/月", t0 + 100L, notificationId = "comma-upcoming-1")
+        )
+        engine.flushExpired(true)
+        assertEquals(0, store.listTransactions().size)
+
+        // 1. Same notification has completed debit + next-month auto-renew notice -> books 15.00
+        engine.ingestNotification(
+            RawNotification("com.tencent.mm", "微信", "微信支付", "本次已扣款15.00元，下月将自动续费", t0 + 1_000L, notificationId = "mixed-sub-1")
+        )
+        engine.flushExpired(true)
+        assertEquals(1, store.listTransactions().size)
+        assertEquals(1500L, engine.getSummary(t0).byCurrency["CNY"]!!.netPersonalExpenseMinor)
+
+        // 2. Same notification has completed 15元 + next-cycle estimated 20元 -> MUST book strictly 15元 (NOT 20元)
+        engine.ingestNotification(
+            RawNotification("com.tencent.mm", "微信", "微信支付", "本次已扣15元，下期预计扣20元", t0 + 30_000L, notificationId = "mixed-sub-2")
+        )
+        engine.flushExpired(true)
+        assertEquals(2, store.listTransactions().size)
+        assertEquals(3000L, engine.getSummary(t0).byCurrency["CNY"]!!.netPersonalExpenseMinor)
+
+        // 3. Reversed clause order ("下期预计扣20元，本次已扣15元") -> still books strictly 15元
+        engine.ingestNotification(
+            RawNotification("com.tencent.mm", "微信", "微信支付", "下期预计扣20元，本次已扣15元", t0 + 60_000L, notificationId = "mixed-sub-3")
+        )
+        engine.flushExpired(true)
+        val txs = store.listTransactions()
+        assertEquals(3, txs.size)
+        assertTrue(txs.all { it.direction == TxDirection.EXPENSE && it.status == TxStatus.RECORDED && it.amountMinor == 1500L })
+        assertEquals(4500L, engine.getSummary(t0).byCurrency["CNY"]!!.netPersonalExpenseMinor)
+    }
+
+    @Test
+    fun upcomingFeeInMixedNotificationIsNotBookedWhileActualFeeStillBooks() {
+        val t0 = 1_700_000_000_000L
+
+        // 1. Upcoming fee in next-cycle reminder clause MUST NOT spawn a premature fee expense
+        val storeUpcoming = InMemoryLedgerStore()
+        val engineUpcoming = LedgerEngine(storeUpcoming)
+        engineUpcoming.ingestNotification(
+            RawNotification("com.tencent.mm", "微信", "微信支付", "本次已扣款15元，下期预计扣手续费2元", t0, notificationId = "upcoming-fee-1")
+        )
+        engineUpcoming.flushExpired(true)
+        assertEquals(1, storeUpcoming.listTransactions().size)
+        val onlyTx = storeUpcoming.listTransactions().single()
+        assertEquals(TxDirection.EXPENSE, onlyTx.direction)
+        assertEquals(TxStatus.RECORDED, onlyTx.status)
+        assertEquals(1500L, onlyTx.amountMinor)
+        assertEquals(1500L, engineUpcoming.getSummary(t0).byCurrency["CNY"]!!.netPersonalExpenseMinor)
+
+        // 2. Variant future fee wording ("下月将收取手续费2元") also stays non-bookable
+        val storeUpcoming2 = InMemoryLedgerStore()
+        val engineUpcoming2 = LedgerEngine(storeUpcoming2)
+        engineUpcoming2.ingestNotification(
+            RawNotification("com.tencent.mm", "微信", "微信支付", "本次已扣款15元，下月将收取手续费2元", t0 + 1_000L, notificationId = "upcoming-fee-2")
+        )
+        engineUpcoming2.flushExpired(true)
+        assertEquals(1, storeUpcoming2.listTransactions().size)
+        assertEquals(1500L, engineUpcoming2.getSummary(t0).byCurrency["CNY"]!!.netPersonalExpenseMinor)
+
+        // 3. Control case: genuine occurred fee ("本次已扣款15元，另收手续费2元") MUST still book 1500 + 200 = 1700
+        val storeActual = InMemoryLedgerStore()
+        val engineActual = LedgerEngine(storeActual)
+        engineActual.ingestNotification(
+            RawNotification("com.tencent.mm", "微信", "微信支付", "本次已扣款15元，另收手续费2元", t0 + 2_000L, notificationId = "actual-fee-1")
+        )
+        engineActual.flushExpired(true)
+        val actualTxs = storeActual.listTransactions()
+        assertEquals(2, actualTxs.size)
+        assertTrue(actualTxs.any { it.amountMinor == 1500L && it.direction == TxDirection.EXPENSE })
+        assertTrue(actualTxs.any { it.amountMinor == 200L && it.direction == TxDirection.EXPENSE && it.category == "手续费" })
+        assertEquals(1700L, engineActual.getSummary(t0).byCurrency["CNY"]!!.netPersonalExpenseMinor)
+    }
+
+    @Test
+    fun mixedZeroAuthWithUpcomingChargeProducesTraceableIgnoredRecordAndZeroExpense() {
+        val store = InMemoryLedgerStore()
+        val engine = LedgerEngine(store)
+        val t0 = 1_700_000_000_000L
+
+        // Mixed 0-yuan pay-later authorization + tomorrow's upcoming charge -> traceable IGNORED record, 0 main expense
+        engine.ingestNotification(
+            RawNotification("com.tencent.mm", "微信", "微信支付分", "已使用先用后付，0元下单，明日将自动扣款19.90元", t0, notificationId = "zero-auth-mixed-1")
+        )
+        engine.flushExpired(true)
+
+        val summary1 = engine.getSummary(t0)
+        assertEquals(0, summary1.recordedCount)
+        assertEquals(0L, summary1.byCurrency["CNY"]!!.netPersonalExpenseMinor)
+        assertEquals(1, summary1.ignoredCount)
+        assertEquals(1, summary1.otherIgnoredCount)
+        assertEquals(0, summary1.internalTransferCount)
+
+        val authTx = store.listTransactions().single()
+        assertEquals(TxDirection.IGNORED, authTx.direction)
+        assertEquals(TxStatus.IGNORED, authTx.status)
+        assertEquals("忽略提醒", authTx.category)
+        val authSources = store.listSourcesForTransaction(authTx.id)
+        assertEquals(1, authSources.size)
+        assertEquals(AmountRole.INSTALLMENT_DUE, authSources.single().first.amountCandidates.single().role)
+
+        // When the actual charge happens the next day, it books cleanly as 19.90 EXPENSE while keeping the prior ignored auth
+        engine.ingestNotification(
+            RawNotification("com.tencent.mm", "微信", "微信支付", "先用后付自动扣款19.90元成功", t0 + 86_400_000L, notificationId = "zero-auth-paid-1")
+        )
+        engine.flushExpired(true)
+
+        val summary2 = engine.getSummary(t0)
+        assertEquals(1, summary2.recordedCount)
+        assertEquals(1990L, summary2.byCurrency["CNY"]!!.netPersonalExpenseMinor)
+        assertEquals(1, summary2.otherIgnoredCount)
+    }
+
+    @Test
+    fun pendingPaymentAndUpcomingAutoDebitRemindersAreBlockedWhileActualChargeBooksOnce() {
+        val store = InMemoryLedgerStore()
+        val engine = LedgerEngine(store)
+        val t0 = 1_700_000_000_000L
+
+        // 1. Pending payment reminder + subsequent actual payment (same merchant & amount) -> strictly 1 expense!
+        engine.ingestNotification(
+            RawNotification("com.eg.android.AlipayGphone", "支付宝", "支付宝", "待付款提醒：向星巴克付款 19.90 元", t0, notificationId = "pending-1")
+        )
+        engine.flushExpired(true)
+        assertEquals(0, store.listTransactions().size)
+
+        engine.ingestNotification(
+            RawNotification("com.eg.android.AlipayGphone", "支付宝", "支付宝", "付款成功：向星巴克付款 19.90 元", t0 + 20_000L, notificationId = "paid-1")
+        )
+        engine.flushExpired(true)
+        assertEquals(1, store.listTransactions().size)
+        assertEquals(1990L, engine.getSummary(t0).byCurrency["CNY"]!!.netPersonalExpenseMinor)
+
+        // 2. Promo monthly price + upcoming auto-debit reminders MUST be blocked, while actual recurring charge books cleanly
+        engine.ingestNotification(
+            RawNotification("com.eg.android.AlipayGphone", "支付宝", "支付宝", "腾讯视频会员特惠 15.00元/月，限时开通", t0 + 30_000L, notificationId = "rate-promo-1")
+        )
+        engine.ingestNotification(
+            RawNotification("com.eg.android.AlipayGphone", "支付宝", "支付宝", "明日将自动扣款 19.90 元", t0 + 31_000L, notificationId = "upcoming-1")
+        )
+        engine.ingestNotification(
+            RawNotification("com.tencent.mm", "微信", "微信支付", "续费提醒：将于明日自动续费扣款 15.00元/月", t0 + 32_000L, notificationId = "upcoming-2")
+        )
+        engine.flushExpired(true)
+        assertEquals(1, store.listTransactions().size)
+
+        engine.ingestNotification(
+            RawNotification("com.tencent.mm", "微信", "微信支付", "会员自动续费扣款15.00元/月", t0 + 40_000L, notificationId = "sub-paid-1")
+        )
+        engine.flushExpired(true)
+
+        val summary = engine.getSummary(t0)
+        assertEquals(2, summary.recordedCount)
+        assertEquals(3490L, summary.byCurrency["CNY"]!!.netPersonalExpenseMinor) // 19.90 + 15.00 only
+    }
+
+    @Test
+    fun merchantExtractionIgnoresPronounDirectionAndGenericXiangPhrases() {
+        assertEquals("未知商户", AiClient.extractMerchant("支付宝：向你发来一份岗位信息 4500元"))
+        assertEquals("未知商户", AiClient.extractMerchant("向朋友分享好物 4500元"))
+        assertEquals("未知商户", AiClient.extractMerchant("王凯通过扫码向你付款50.00元"))
+        assertEquals("未知商户", AiClient.extractMerchant("向您转账100.00元"))
+        assertEquals("你好便利店", AiClient.extractMerchant("向你好便利店付款19.90元"))
+        assertEquals("您好大药房", AiClient.extractMerchant("向您好大药房付款28.00元"))
+        assertEquals("瑞幸咖啡", AiClient.extractMerchant("向瑞幸咖啡付款19.90元"))
+        assertEquals("中国移动", AiClient.extractMerchant("向中国移动话费充值100.00元"))
+        assertEquals("海底捞", AiClient.extractMerchant("向海底捞AA 垫付 200 元"))
+        assertEquals("张记面馆", AiClient.extractMerchant("付款给张记面馆"))
+    }
+
+    @Test
+    fun markAsIgnoredRemovesFromLedgerSupportsUndoAndGuardedByRevision() {
+        val store = InMemoryLedgerStore()
+        val engine = LedgerEngine(store)
+        val t0 = 1_700_000_000_000L
+
+        engine.ingestNotification(
+            RawNotification("com.eg.android.AlipayGphone", "支付宝", "付款成功", "向星巴克付款45.00元", t0, notificationId = "n-ign-1")
+        )
+        engine.flushExpired(true)
+        val tx = store.listTransactions().single()
+        assertEquals(1, engine.getSummary(t0).recordedCount)
+        assertEquals(4500L, engine.getSummary(t0).byCurrency["CNY"]!!.netPersonalExpenseMinor)
+
+        // Stale revision guard
+        assertNull(engine.markAsIgnored(tx.id, expectedRevision = tx.revision + 99))
+
+        val ch = engine.markAsIgnored(tx.id, expectedRevision = tx.revision)
+        assertNotNull(ch)
+        val ignoredTx = store.getTransaction(tx.id)!!
+        assertEquals(TxDirection.IGNORED, ignoredTx.direction)
+        assertEquals(TxStatus.IGNORED, ignoredTx.status)
+        assertEquals("忽略提醒", ignoredTx.category)
+
+        val summaryAfterIgnore = engine.getSummary(t0)
+        assertEquals(0, summaryAfterIgnore.recordedCount)
+        assertEquals(0L, summaryAfterIgnore.byCurrency["CNY"]!!.netPersonalExpenseMinor)
+        assertEquals(1, summaryAfterIgnore.otherIgnoredCount)
+        assertEquals(0, summaryAfterIgnore.internalTransferCount)
+
+        // Idempotent second call on already-ignored tx returns null
+        assertNull(engine.markAsIgnored(tx.id, expectedRevision = ignoredTx.revision))
+
+        // Undo cleanly restores original expense
+        assertTrue(engine.undoChange(ch!!.opId))
+        val restored = store.getTransaction(tx.id)!!
+        assertEquals(TxDirection.EXPENSE, restored.direction)
+        assertEquals(TxStatus.RECORDED, restored.status)
+        assertEquals(4500L, engine.getSummary(t0).byCurrency["CNY"]!!.netPersonalExpenseMinor)
+        assertEquals(0, engine.getSummary(t0).otherIgnoredCount)
+    }
 }

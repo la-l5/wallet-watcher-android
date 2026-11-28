@@ -71,11 +71,14 @@ object AiClient {
 
     private val merchantPatterns = listOf(
         Regex("""(?:商户|收款方|交易对方|对方|收款商户)[：:\s]*([^\s，。,;；()（）¥￥0-9]{2,20})"""),
-        Regex("""(?:向|付款给)([^\s，。,;；()（）¥￥0-9]{2,16}?)(?:付款|转账|支付|消费|第三方存管|转出|转入|扣款|$)"""),
+        Regex("""付款给([^\s，。,;；()（）¥￥0-9]{2,16}?)(?:付款|转账|支付|消费|第三方存管|转出|转入|扣款|充值|垫付|$)"""),
+        Regex("""向(?!(?:你|您)(?:付款|转账|支付|消费|转出|转入|扣款|发来|推荐|分享|发送))([^\s，。,;；()（）¥￥0-9]{2,16}?)(?:付款|转账|支付|消费|第三方存管|转出|转入|扣款|话费充值|充值|AA|垫付)"""),
         Regex("""消费[，,\s]*([^\s，。,;；¥￥0-9]{2,16})"""),
         Regex("""来自([^\s，。,;；]{2,16})的"""),
         Regex("""([^\s，。,;；]{2,14}?)(?:自动扣款|免密扣款|先用后付|扣款)""")
     )
+
+    private val receivedMoneyCueRegex = Regex("""(?:已)?收到\s*(?:转账|收款|付款|退款|红包|一笔|来自|[\d¥￥])""")
 
     private val acquirerPrefixRegex = Regex("""^(?:财付通|微信支付|支付宝|网联|银联商务|银联|快捷支付|特约商户)[-—_:：\s]+""")
     private val trailingVerbRegex = Regex("""(?:付款|转账|支付|消费|转出|转入|扣款|第三方存管.*)$""")
@@ -368,14 +371,15 @@ object AiClient {
         }
 
         // 5. Income vs Expense
-        val incomeCues = listOf("收款", "收入", "入账", "到账", "工资", "代发", "收到", "红包", "转入", "分红", "股息", "向你付款", "向您付款", "已存入")
-        val expenseCues = listOf("支出", "付款", "消费", "扣款", "支取", "划扣", "代扣", "实付", "支付成功", "向", "已付", "免密扣款", "自动续费", "转出", "分期购机", "垫付")
+        val incomeCues = listOf("收款", "收入", "入账", "到账", "工资", "代发", "收到转账", "收到收款", "收到付款", "收到红包", "收到一笔", "红包", "转入", "分红", "股息", "向你付款", "向您付款", "已存入")
+        val expenseCues = listOf("支出", "付款", "消费", "扣款", "已扣", "支取", "划扣", "代扣", "实付", "支付成功", "已支付", "成功支付", "已付", "免密扣款", "自动续费", "转出", "分期购机", "垫付")
         val textWithoutPayer = text.replace("付款方", "").replace("付款人", "").replace("向你付款", "").replace("向您付款", "")
-        val strongExpenseCues = listOf("支付成功", "扣款", "付款给", "消费", "支取", "实付", "分期购机", "垫付")
+        val strongExpenseCues = listOf("支付成功", "已支付", "成功支付", "扣款", "已扣", "已付", "付款给", "消费", "支取", "实付", "分期购机", "垫付")
+        val hasIncomeCue = incomeCues.any { text.contains(it) } || receivedMoneyCueRegex.containsMatchIn(text)
 
         val direction: TxDirection
         val reasoning: String
-        if (payload.roughDirection == "IN" || (incomeCues.any { text.contains(it) } && strongExpenseCues.none { textWithoutPayer.contains(it) })) {
+        if (payload.roughDirection == "IN" || (hasIncomeCue && strongExpenseCues.none { textWithoutPayer.contains(it) })) {
             direction = TxDirection.INCOME
             reasoning = "资金由外部流入本人账户，判定为真实收入。"
         } else if (payload.roughDirection == "OUT" || expenseCues.any { textWithoutPayer.contains(it) }) {
@@ -395,7 +399,7 @@ object AiClient {
         }
 
         val merchant = preferredMerchant ?: extractMerchant(text)
-        val needsReview = payload.ambiguityReason != null || (merchant == "未知商户" && reasoning.contains("模糊"))
+        val needsReview = payload.ambiguityReason != null || reasoning.contains("模糊")
         val localItem = payload.localItemHint?.trim()?.takeIf { it.length >= 2 }
         val categoryText = if (localItem != null) "$text $localItem" else text
 
@@ -478,7 +482,7 @@ object AiClient {
             }
             TxDirection.IGNORED -> "先用后付0元授权"
             else -> when {
-                text.contains("工资") || text.contains("代发") -> "工资/薪资入账"
+                listOf("工资", "代发", "薪资", "底薪", "月薪", "年薪", "发薪").any { text.contains(it) } -> "工资/薪资入账"
                 text.contains("红包") -> "红包往来"
                 text.contains("乘车") || text.contains("地铁") || text.contains("公交") -> "公共交通乘车扣费"
                 text.contains("续费") || text.contains("会员") -> "$merchant 自动续费/会员"
@@ -496,7 +500,7 @@ object AiClient {
             TxDirection.REFUND -> "退款冲抵"
             TxDirection.REIMBURSEMENT_OFFSET -> "AA/报销冲抵"
             TxDirection.INCOME -> when {
-                listOf("工资", "薪资", "代发", "奖金", "绩效").any { text.contains(it) } -> "工资收入"
+                listOf("工资", "薪资", "底薪", "月薪", "日薪", "年薪", "发薪", "代发", "奖金", "绩效").any { text.contains(it) } -> "工资收入"
                 listOf("分红", "股息", "利息", "收益").any { text.contains(it) } -> "投资收益"
                 listOf("转账", "红包", "收款").any { text.contains(it) } -> "人情转账"
                 else -> "副业/其他收入"

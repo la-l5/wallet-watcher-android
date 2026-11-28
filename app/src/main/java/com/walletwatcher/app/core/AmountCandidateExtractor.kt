@@ -33,6 +33,50 @@ object AmountCandidateExtractor {
         "微信余额", "微信零钱", "零钱通", "支付宝余额", "余额宝", "银行卡", "储蓄卡", "信用卡", "花呗", "白条", "数字人民币"
     )
 
+    // Matches standalone quote suffix "起" (e.g. "19.9元起", "19.9元起/月"), avoiding financial words like "起息"/"起算"
+    private val STANDALONE_QI_SUFFIX_REGEX = Regex("""^起(?=$|[\s，。,;；)）!！?？/])""")
+
+    // Unpaid / upcoming-charge phrases that mark a clause as NOT yet charged
+    private val PENDING_OR_UPCOMING_KEYWORDS = listOf(
+        "待付款", "待支付", "未付款", "未支付", "等待付款", "等待支付",
+        "去付款", "去支付", "立即付款", "立即支付", "尽快付款", "尽快支付",
+        "请付款", "请支付", "请及时付款", "请及时支付", "请完成支付", "请完成付款",
+        "超时将取消", "超时未支付", "即将关闭",
+        "即将扣款", "即将自动扣款", "即将续费", "即将自动续费", "将自动扣款", "将自动续费",
+        "预计扣款", "预计扣", "预扣款", "拟扣款", "自动扣款预告", "续费提醒", "自动续费提醒", "到期提醒", "即将到期"
+    )
+
+    private val UPCOMING_CHARGE_REGEX = Regex(
+        """(?:明日|明天|次日|即将|将于|预计|后天|下周|下月|次月|下期|\d+天后|\d+小时后|\d+分钟内)[将要会拟自动定期为你您按期预计完成进行于\s\d月日号时分:-]{0,12}(?:扣款|扣除|续费|付款|支付|划扣|代扣|(?:扣收|收取|另收|扣)?(?:手续费|服务费|佣金)(?=$|\s*(?:人民币|CNY|RMB|[¥￥$€£]|\d))|(?:扣收|收取|另收|扣)(?:费用|费)?(?=$|\s*(?:人民币|CNY|RMB|[¥￥$€£]|\d)))"""
+    )
+
+    internal fun splitClauses(text: String): List<String> {
+        val out = mutableListOf<String>()
+        val buf = StringBuilder()
+        for (ch in text) {
+            if (ch == '，' || ch == ',' || ch == '。' || ch == ';' || ch == '；' ||
+                ch == '\n' || ch == '!' || ch == '！' || ch == '?' || ch == '？' ||
+                ch == '（' || ch == '(' || ch == '）' || ch == ')'
+            ) {
+                val part = buf.toString().trim()
+                if (part.isNotEmpty()) out.add(part)
+                buf.setLength(0)
+            } else {
+                buf.append(ch)
+            }
+        }
+        val tail = buf.toString().trim()
+        if (tail.isNotEmpty()) out.add(tail)
+        return out
+    }
+
+    internal fun isPendingOrUpcomingClause(clause: String): Boolean {
+        if (PENDING_OR_UPCOMING_KEYWORDS.any { clause.contains(it) }) {
+            return true
+        }
+        return UPCOMING_CHARGE_REGEX.containsMatchIn(clause)
+    }
+
     private val NON_BOOKABLE_ROLES = setOf(
         AmountRole.BALANCE,
         AmountRole.LIST_PRICE,
@@ -68,12 +112,17 @@ object AmountCandidateExtractor {
             if (minor == 0L) continue
 
             val clauseStart = findClauseStart(text, start)
+            val clauseEnd = findClauseEnd(text, end)
             val beforeClause = text.substring(clauseStart, start)
+            val fullClause = text.substring(clauseStart, clauseEnd)
+            val clauseAfter = text.substring(end, clauseEnd)
             val nearBefore = text.substring(maxOf(0, start - 14), start)
             val afterClause = text.substring(end, minOf(text.length, end + 12))
 
             val (role, isEstimated, fundingHint) = classifyRole(
                 beforeClause = beforeClause,
+                fullClause = fullClause,
+                clauseAfter = clauseAfter,
                 nearBefore = nearBefore,
                 afterClause = afterClause,
                 currency = currency,
@@ -113,14 +162,41 @@ object AmountCandidateExtractor {
 
     private fun findClauseStart(text: String, pos: Int): Int {
         var i = pos - 1
+        var closedParens = 0
         while (i >= 0) {
             val ch = text[i]
-            if (ch == '，' || ch == ',' || ch == '。' || ch == ';' || ch == '；' || ch == '\n' || ch == '＋' || ch == '+') {
+            if (ch == '，' || ch == ',' || ch == '。' || ch == ';' || ch == '；' ||
+                ch == '\n' || ch == '＋' || ch == '+' || ch == '!' || ch == '！' || ch == '?' || ch == '？'
+            ) {
                 return i + 1
+            }
+            if (ch == '）' || ch == ')') {
+                closedParens++
+            } else if (ch == '（' || ch == '(') {
+                if (closedParens > 0) {
+                    closedParens--
+                } else {
+                    return i + 1
+                }
             }
             i--
         }
         return 0
+    }
+
+    private fun findClauseEnd(text: String, pos: Int): Int {
+        var i = pos
+        while (i < text.length) {
+            val ch = text[i]
+            if (ch == '，' || ch == ',' || ch == '。' || ch == ';' || ch == '；' ||
+                ch == '\n' || ch == '＋' || ch == '+' || ch == '!' || ch == '！' || ch == '?' || ch == '？' ||
+                ch == '（' || ch == '(' || ch == '）' || ch == ')'
+            ) {
+                return i
+            }
+            i++
+        }
+        return text.length
     }
 
     private fun normalizeCurrency(token: String): String = when (token.trim().uppercase(Locale.US)) {
@@ -134,6 +210,8 @@ object AmountCandidateExtractor {
 
     private fun classifyRole(
         beforeClause: String,
+        fullClause: String,
+        clauseAfter: String,
         nearBefore: String,
         afterClause: String,
         currency: String,
@@ -141,6 +219,16 @@ object AmountCandidateExtractor {
     ): Triple<AmountRole, Boolean, String?> {
         val trimmedBefore = beforeClause.trim()
         val trimmedNear = nearBefore.trim()
+        val trimmedFullClause = fullClause.trim()
+        val trimmedClauseAfter = clauseAfter.trim()
+
+        // 0. Pending / upcoming charge or bill-due clause MUST run BEFORE fee/split/settlement/paid checks
+        //    so a future estimated fee (e.g. "本次已扣款15元，下期预计扣手续费2元") can never become a bookable FEE.
+        if (listOf("首期应还", "本期应还", "每期应还", "应还金额", "应还", "待还", "最低还款").any { trimmedBefore.contains(it) } ||
+            isPendingOrUpcomingClause(trimmedFullClause)
+        ) {
+            return Triple(AmountRole.INSTALLMENT_DUE, false, null)
+        }
 
         // 1. Estimated vs confirmed RMB settlement for foreign-currency spending
         if (currency == "CNY") {
@@ -166,16 +254,11 @@ object AmountCandidateExtractor {
             }
         }
 
-        // 3. Fee / service charge
+        // 3. Fee / service charge (already guarded against upcoming/due clauses in step 0)
         if (listOf("手续费", "服务费", "佣金", "另收费", "费率").any { trimmedBefore.contains(it) } ||
             (trimmedBefore.contains("另收") && trimmedBefore.contains("费"))
         ) {
             return Triple(AmountRole.FEE, false, null)
-        }
-
-        // 4. Installment due / bill reminder amount (not actual charge)
-        if (listOf("首期应还", "本期应还", "每期应还", "应还金额", "应还", "待还", "最低还款").any { trimmedBefore.contains(it) }) {
-            return Triple(AmountRole.INSTALLMENT_DUE, false, null)
         }
 
         // 5. Remaining account balance / credit limit
@@ -197,13 +280,44 @@ object AmountCandidateExtractor {
             return Triple(AmountRole.LIST_PRICE, false, null)
         }
 
+        // 7b. Non-transactional salary/rate/quote amounts (e.g. "薪资4500元/月", "月薪4500元", "19.9元起")
+        val beforeForPay = trimmedBefore
+            .replace("支付宝", "")
+            .replace("微信支付分", "")
+            .replace("支付密码", "")
+            .replace("支付安全", "")
+            .replace("支付保护", "")
+            .replace("支付设置", "")
+            .replace(Regex("""微信支付(?!凭证|成功)"""), "")
+        val hasCompletedSettlementVerb = listOf(
+            "实付", "实际支付", "实际扣款", "付款", "消费", "支出", "扣款", "已扣", "已付", "支取", "划扣", "代扣",
+            "已支付", "支付成功", "成功支付", "分期购机", "分期消费", "垫付",
+            "代发", "入账", "到账", "存入", "收款", "退款", "退回", "报销", "返还", "分红", "股息",
+            "提现", "还款", "转账", "转出", "转入", "实发"
+        ).any { beforeForPay.contains(it) } || listOf(
+            "已入账", "入账", "已到账", "到账", "已存入", "存入",
+            "已扣款", "已扣", "扣款成功", "支付成功", "付款成功", "已支付", "已退回", "退款成功"
+        ).any { trimmedClauseAfter.contains(it) }
+        val trimmedAfter = afterClause.trimStart()
+        val hasRateOrQuoteSuffix = listOf("/月", "/天", "/日", "/小时", "/周", "/年").any { trimmedAfter.startsWith(it) } ||
+            STANDALONE_QI_SUFFIX_REGEX.containsMatchIn(trimmedAfter)
+        val looksLikeSalaryOrRateQuote = !hasCompletedSettlementVerb && (
+            listOf("月薪", "日薪", "年薪", "底薪", "薪资", "起薪", "推荐岗位", "岗位信息", "岗位薪资", "预算").any { beforeForPay.contains(it) } ||
+                hasRateOrQuoteSuffix
+            )
+        if (looksLikeSalaryOrRateQuote) {
+            return Triple(AmountRole.LIST_PRICE, false, null)
+        }
+
         // 8. Explicit actual payment / spend
-        if (listOf("实付", "实际支付", "实际扣款", "付款", "消费", "支出", "扣款", "支取", "划扣", "代扣", "支付", "分期购机", "分期消费", "购买", "垫付").any { trimmedBefore.contains(it) }) {
+        if (listOf("实付", "实际支付", "实际扣款", "付款", "消费", "支出", "扣款", "已扣", "已付", "支取", "划扣", "代扣", "支付", "分期购机", "分期消费", "购买", "垫付").any { beforeForPay.contains(it) }) {
             return Triple(AmountRole.PAID, false, fundingHint)
         }
 
         // 9. Principal transfer / withdrawal / income / refund / reimbursement
-        if (listOf("提现", "到账", "入账", "转账", "转出", "转入", "收款", "退款", "退回", "还款", "充值", "分红", "返还", "报销", "工资", "代发", "存入").any { trimmedBefore.contains(it) }) {
+        if (listOf("提现", "到账", "入账", "转账", "转出", "转入", "收款", "退款", "退回", "还款", "充值", "分红", "返还", "报销", "工资", "代发", "存入").any { trimmedBefore.contains(it) } ||
+            listOf("已入账", "入账", "已到账", "到账", "已存入", "存入", "已退回", "退款成功").any { trimmedClauseAfter.contains(it) }
+        ) {
             return Triple(AmountRole.PRINCIPAL, false, fundingHint)
         }
 

@@ -661,6 +661,21 @@ class LedgerEngine(
         if (clue.amountMinor == null && !clue.isZeroAuth) {
             return
         }
+        // Fail-closed guard for non-accessibility notifications:
+        // if neither transaction direction nor primary amount role can be identified (and not zero-auth/internal),
+        // reject rather than booking arbitrary non-transactional notifications containing numbers.
+        if (notif.sourceType != ScreenBillParser.SOURCE_TYPE_ACCESSIBILITY &&
+            !clue.isZeroAuth &&
+            clue.preInternalReason == null &&
+            clue.roughDirection == "UNKNOWN"
+        ) {
+            val primaryRole = clue.primaryCandidateId?.let { cid ->
+                clue.candidates.firstOrNull { it.candidateId == cid }?.role
+            }
+            if (primaryRole == null || primaryRole == AmountRole.UNKNOWN) {
+                return
+            }
+        }
         val (previewSanitized, _) = PrivacySanitizer.sanitize(
             "[${notif.appName}] ${notif.title}: ${notif.content}",
             profile
@@ -868,6 +883,45 @@ class LedgerEngine(
             ch
         }
         if (change != null) notifyChanged()
+        change
+    }
+
+    fun markAsIgnored(
+        txId: String,
+        reason: String = "用户手动标为误记/非交易通知",
+        expectedRevision: Int? = null
+    ): TransactionChange? = synchronized(finalizeLock) {
+        val change = store.runInTransaction {
+            val old = store.getTransaction(txId) ?: return@runInTransaction null
+            if (expectedRevision != null && old.revision != expectedRevision) return@runInTransaction null
+            if (old.status == TxStatus.IGNORED && old.direction == TxDirection.IGNORED) return@runInTransaction null
+            val now = nowProvider()
+            val updated = old.copy(
+                direction = TxDirection.IGNORED,
+                status = TxStatus.IGNORED,
+                category = "忽略提醒",
+                ignoreReason = reason,
+                updatedAtMs = now,
+                revision = old.revision + 1
+            )
+            val ch = TransactionChange(
+                opType = ChangeOpType.EDIT,
+                affectedTxIds = listOf(old.id),
+                beforeRevisions = mapOf(old.id to old.revision),
+                afterRevisions = mapOf(old.id to updated.revision),
+                inversePayloadJson = JSONObject().apply {
+                    put("transactions", JSONArray().put(BackupCodec.txToJson(old)))
+                }.toString(),
+                createdAtMs = now
+            )
+            store.saveTransaction(updated)
+            store.saveChange(ch)
+            ch
+        }
+        if (change != null) {
+            store.addLog("USER_IGNORE", "手动将账单(${txId.take(8)})标为误记并移出主账本")
+            notifyChanged()
+        }
         change
     }
 
@@ -1661,19 +1715,77 @@ class LedgerEngine(
         )
     }
 
+    private fun stripBrandNoise(text: String): String {
+        return text
+            .replace("支付宝", "")
+            .replace("微信支付分", "")
+            .replace("支付密码", "")
+            .replace("支付安全", "")
+            .replace("支付保护", "")
+            .replace("支付设置", "")
+            .replace("支付协议", "")
+            .replace(BARE_WECHAT_PAY_BRAND_REGEX, "")
+    }
+
+    private fun isZeroAuthText(text: String): Boolean {
+        if (ZERO_AUTH_KEYWORDS.none { text.contains(it) }) return false
+        val actionText = stripBrandNoise(text)
+        return ZERO_AUTH_ACTUAL_CHARGE_KEYWORDS.none { actionText.contains(it) } &&
+            !ACTUAL_CHARGE_SUCCESS_REGEX.containsMatchIn(actionText)
+    }
+
+    private fun hasRealCompletedVoucher(clauseActionText: String): Boolean {
+        if (REAL_VOUCHER_OVERRIDE_KEYWORDS.any { clauseActionText.contains(it) }) {
+            return true
+        }
+        return PAID_AMOUNT_OVERRIDE_REGEX.containsMatchIn(clauseActionText) ||
+            ACCOUNT_CREDIT_VOUCHER_REGEX.containsMatchIn(clauseActionText)
+    }
+
     private fun isFinanceRelated(text: String): Boolean {
         if (FAILED_TX_KEYWORDS.any { text.contains(it) }) {
             return false
         }
-        if (NOISE_BLACKLIST_KEYWORDS.any { text.contains(it) }) {
-            val isRealVoucher = listOf(
-                "微信支付凭证", "付款成功", "支付成功", "扣款成功", "已扣款",
-                "入账", "到账人民币", "退款成功", "实付", "分期购机", "另收手续费"
-            ).any { text.contains(it) }
+        if (HARD_NOISE_KEYWORDS.any { text.contains(it) }) {
+            return false
+        }
+        // Traceable 0-yuan pay-later authorizations enter the IGNORED path even when paired
+        // with an upcoming-charge clause (e.g. "已使用先用后付，0元下单，明日将自动扣款19.90元").
+        if (isZeroAuthText(text)) {
+            return true
+        }
+
+        val clauses = AmountCandidateExtractor.splitClauses(text)
+        val pendingClauses = clauses.filter { AmountCandidateExtractor.isPendingOrUpcomingClause(it) }
+        val nonPendingClauses = clauses.filterNot { AmountCandidateExtractor.isPendingOrUpcomingClause(it) }
+        if (pendingClauses.isNotEmpty()) {
+            val nonPendingActionClauses = nonPendingClauses.map { stripBrandNoise(it) }
+            val hasCompletedInNonPending = nonPendingActionClauses.any { clause ->
+                COMPLETED_CLAUSE_VOUCHER_KEYWORDS.any { clause.contains(it) } ||
+                    PAID_AMOUNT_OVERRIDE_REGEX.containsMatchIn(clause) ||
+                    ACCOUNT_CREDIT_VOUCHER_REGEX.containsMatchIn(clause)
+            }
+            val hasDigitInNonPending = nonPendingClauses.any { DIGIT_REGEX.containsMatchIn(it) }
+            if (!hasCompletedInNonPending || !hasDigitInNonPending) {
+                return false
+            }
+        }
+
+        val hasContextualNoise = CONTEXTUAL_NOISE_KEYWORDS.any { text.contains(it) } ||
+            RATE_QUOTE_SUFFIX_REGEX.containsMatchIn(text)
+        if (hasContextualNoise) {
+            val isRealVoucher = nonPendingClauses
+                .map { stripBrandNoise(it) }
+                .any { hasRealCompletedVoucher(it) }
             if (!isRealVoucher) return false
         }
-        if (FINANCE_KEYWORDS.any { text.contains(it, ignoreCase = true) }) {
-            return DIGIT_REGEX.containsMatchIn(text) || listOf("先用后付", "免密签约", "银证").any { text.contains(it) }
+
+        val nonPendingActionText = nonPendingClauses.joinToString(" ") { stripBrandNoise(it) }
+        val hasTransactionAction = TRANSACTION_ACTION_KEYWORDS.any { nonPendingActionText.contains(it, ignoreCase = true) } ||
+            PAID_AMOUNT_ACTION_REGEX.containsMatchIn(nonPendingActionText) ||
+            RECEIVED_AMOUNT_ACTION_REGEX.containsMatchIn(nonPendingActionText)
+        if (hasTransactionAction) {
+            return nonPendingClauses.any { DIGIT_REGEX.containsMatchIn(it) }
         }
         return false
     }
@@ -1683,22 +1795,34 @@ class LedgerEngine(
         val extraction = AmountCandidateExtractor.extract(text)
         val primaryCand = extraction.primaryCandidate
         val cardTail = CARD_TAIL_REGEX.find(text)?.groupValues?.getOrNull(1)
-        val isZeroAuth = ZERO_AUTH_KEYWORDS.any { text.contains(it) } &&
-            listOf("实际扣款", "已扣款", "扣款成功", "已完成扣款", "微信支付凭证", "付款成功", "支付成功").none { text.contains(it) } &&
-            !Regex("""扣款[\d.,¥￥元\s]*成功""").containsMatchIn(text)
+        val isZeroAuth = isZeroAuthText(text)
 
-        val textNoPayer = text.replace("付款方", "").replace("付款人", "").replace("向你付款", "").replace("向您付款", "")
+        val nonPendingClauses = AmountCandidateExtractor.splitClauses(text)
+            .filterNot { AmountCandidateExtractor.isPendingOrUpcomingClause(it) }
+        val effectiveDirText = if (!isZeroAuth && nonPendingClauses.isNotEmpty()) {
+            nonPendingClauses.joinToString(" ")
+        } else {
+            text
+        }
+        val textNoPayer = stripBrandNoise(
+            effectiveDirText.replace("付款方", "").replace("付款人", "").replace("向你付款", "").replace("向您付款", "")
+        )
+        val actionText = stripBrandNoise(effectiveDirText)
         val explicitOffset = listOf("AA返还", "AA收款", "朋友返还", "分摊返还", "报销", "差旅报销", "垫付返还").any { text.contains(it, ignoreCase = true) }
-        val explicitIncome = listOf("向你付款", "向您付款", "收款到账", "收款成功", "已存入", "代发工资", "工资入账", "证券转银行").any { text.contains(it) }
+        val explicitIncome = listOf("向你付款", "向您付款", "收款到账", "收款成功", "已存入", "代发工资", "工资入账", "代发薪资", "薪资入账", "证券转银行").any { text.contains(it) }
+        val hasStrongOutVerb = listOf("付款", "支出", "消费", "扣款", "已扣", "已付", "支取", "划扣", "代扣", "实付", "支付成功", "已支付", "成功支付", "银行转证券", "提现", "分期购机", "垫付").any { textNoPayer.contains(it) } ||
+            PAID_AMOUNT_ACTION_REGEX.containsMatchIn(textNoPayer)
+        val hasIncomeVerb = listOf("收款", "收入", "入账", "到账", "工资", "代发", "转入", "分红", "股息").any { actionText.contains(it) } ||
+            RECEIVED_AMOUNT_ACTION_REGEX.containsMatchIn(actionText)
+        val hasGeneralOutVerb = listOf("支出", "付款", "消费", "扣款", "已扣", "已付", "支取", "划扣", "代扣", "实付", "支付成功", "已支付", "成功支付", "支付了", "转出", "转账", "提现", "还款", "银行转证券", "分期购机", "垫付", "自动续费").any { textNoPayer.contains(it) } ||
+            PAID_AMOUNT_ACTION_REGEX.containsMatchIn(textNoPayer)
         val roughDir = when {
             isZeroAuth -> "ZERO_AUTH"
             explicitOffset -> "OFFSET"
             listOf("退款", "已退回", "原路退回", "退货").any { text.contains(it) } -> "REFUND"
             explicitIncome -> "IN"
-            listOf("收款", "收入", "入账", "到账", "收到", "工资", "代发", "转入", "分红", "股息").any { text.contains(it) } -> {
-                if (listOf("付款", "支出", "消费", "扣款", "支取", "划扣", "代扣", "实付", "支付成功", "银行转证券", "提现", "分期购机", "垫付").any { textNoPayer.contains(it) }) "OUT" else "IN"
-            }
-            listOf("支出", "付款", "消费", "扣款", "支取", "划扣", "代扣", "实付", "支付", "转出", "转账", "提现", "还款", "银行转证券", "分期购机", "垫付").any { textNoPayer.contains(it) } -> "OUT"
+            hasIncomeVerb -> if (hasStrongOutVerb) "OUT" else "IN"
+            hasGeneralOutVerb -> "OUT"
             Regex("""(?:[¥￥]|RMB|CNY|[：:\s])\s*-\s*\d""").containsMatchIn(text) -> "OUT"
             Regex("""(?:[¥￥]|RMB|CNY|[：:\s])\s*\+\s*\d""").containsMatchIn(text) -> "IN"
             else -> "UNKNOWN"
@@ -1884,27 +2008,80 @@ class LedgerEngine(
         private val DIGIT_REGEX = Regex("""\d""")
         private val CARD_TAIL_REGEX = Regex("""(?:(?:尾号|卡号)为?|\*{2,4})\s*(?:\d{8,15})?(\d{4})(?!\d)""")
         private val TRANSFER_SEMANTIC_WORDS = listOf("转入", "转出", "转账", "汇款", "跨行")
+        private val BARE_WECHAT_PAY_BRAND_REGEX = Regex("""微信支付(?!凭证|成功)""")
+        private val PAID_AMOUNT_ACTION_REGEX = Regex("""支付\s*(?:[¥￥$€£]|RMB|CNY|USD|EUR|GBP|HKD|JPY|人民币|\d)""", RegexOption.IGNORE_CASE)
+        private val RECEIVED_AMOUNT_ACTION_REGEX = Regex("""(?:已)?收到\s*(?:转账|收款|付款|退款|红包|一笔|来自|[\d¥￥])""")
+        private val ACTUAL_CHARGE_SUCCESS_REGEX = Regex("""扣款[\d.,¥￥元\s]*成功""")
+        private val PAID_AMOUNT_OVERRIDE_REGEX = Regex("""实付\s*(?:人民币|CNY|RMB|[¥￥$€£])?\s*\d""", RegexOption.IGNORE_CASE)
+        private val ACCOUNT_CREDIT_VOUCHER_REGEX = Regex("""(?:已入账|入账|已存入|存入)\s*(?:人民币|CNY|RMB|[¥￥$€£])?\s*\d""", RegexOption.IGNORE_CASE)
+        private val RATE_QUOTE_SUFFIX_REGEX = Regex("""元(?:/(?:月|天|日|周|小时|年)|起(?=$|[\s，。,;；)）!！?？/]))""")
 
         private val FAILED_TX_KEYWORDS = listOf(
             "交易失败", "付款失败", "支付失败", "扣款失败", "转账失败", "还款失败", "退款失败",
             "余额不足", "交易关闭", "订单已取消", "支付已取消", "操作已撤销", "未扣款成功"
         )
 
-        private val NOISE_BLACKLIST_KEYWORDS = listOf(
+        // Unconditionally non-transactional domains (never appear in completed payment/salary vouchers)
+        private val HARD_NOISE_KEYWORDS = listOf(
             "验证码", "动态密码", "校验码", "短信验证", "安全验证",
+            "岗位信息", "职位信息", "推荐岗位", "新职位",
+            "发来一份", "给你发来", "向你推荐", "为你推荐", "在线直聊",
+            "提额", "授信额度", "最高可借", "最高可贷", "可借额度", "日利率", "年化利率", "额度已生效", "邀您开通",
+            "开启免密", "开通免密", "免密额度", "以内免密",
+            "本周账单", "本月账单", "账单报告", "账单总结", "年度账单", "消费报告", "收支报告", "周报", "月报",
+            "取件码",
+            "蚂蚁森林", "蚂蚁庄园", "芭芭农场", "浇水", "喂小鸡", "集福"
+        )
+
+        // Contextual noise / salary-ad / promo / reminder cues
+        // (overridable ONLY when an explicit completed transaction voucher exists in a non-pending clause)
+        private val CONTEXTUAL_NOISE_KEYWORDS = listOf(
+            "招聘", "求职", "面试", "简历", "投递", "招工", "兼职", "急招", "热招",
+            "薪资", "月薪", "日薪", "年薪", "底薪", "起薪",
+            "已签收", "已发货", "派送中", "快递已",
             "优惠券", "代金券", "神券", "消费券", "立减券", "立减金", "满减", "领券",
             "申领指南", "补贴申领", "达标可领", "预提取", "活动规则", "待领取", "可领取", "免费领",
             "红包雨", "抽奖", "立省", "降价", "预售", "秒杀", "点击领取", "立即领取", "去使用", "助力",
             "账单已出", "本期应还", "应还金额", "最低还款", "还款提醒", "待还款", "最后还款日"
         )
 
-        private val FINANCE_KEYWORDS = listOf(
-            "支付", "付款", "收款", "扣款", "支取", "划扣", "代扣", "实付", "消费", "转账",
-            "支出", "收入", "入账", "到账", "退款", "退回", "还款", "提现", "充值",
-            "银证", "证券", "余额宝", "零钱通", "花呗", "信用卡", "白条", "月付",
-            "先用后付", "先享后付", "免密", "工资", "代发", "红包", "乘车码", "动账",
-            "基金", "理财", "分红", "返还", "报销", "垫付", "分期购机", "手续费",
-            "RMB", "CNY", "USD", "EUR", "GBP", "HKD", "JPY", "美元", "元", "¥", "￥", "$"
+        // Explicit completed-tense vouchers that distinguish a completed clause from an accompanying upcoming reminder
+        private val COMPLETED_CLAUSE_VOUCHER_KEYWORDS = listOf(
+            "微信支付凭证", "付款成功", "支付成功", "已支付", "成功支付", "已付款", "已付",
+            "扣款成功", "已扣款", "已扣", "实际扣款", "已自动扣款", "本次扣款", "本次已扣",
+            "已消费", "消费成功", "已支取", "已划扣", "已代扣",
+            "已入账", "入账成功", "已存入", "存入人民币", "到账人民币",
+            "代发工资", "工资入账", "代发薪资", "薪资入账", "发薪入账",
+            "收款成功", "收款到账", "已收款", "退款成功", "已退款", "已退回", "原路退回"
+        )
+
+        private val REAL_VOUCHER_OVERRIDE_KEYWORDS = listOf(
+            "微信支付凭证", "付款成功", "支付成功", "已支付", "成功支付", "已付款",
+            "扣款成功", "已扣款", "实际扣款", "自动续费扣款", "免密扣款", "已自动扣款", "本次扣款", "本次已扣",
+            "代发工资", "工资入账", "代发薪资", "薪资入账", "发薪入账", "到账人民币",
+            "已入账", "入账成功", "已存入", "存入人民币", "转账入账", "汇款入账", "收款到账", "收款成功",
+            "退款成功", "分期购机", "另收手续费"
+        )
+
+        private val ZERO_AUTH_ACTUAL_CHARGE_KEYWORDS = listOf(
+            "实际扣款", "已扣款", "已扣", "本次已扣", "本次扣款", "扣款成功", "已完成扣款",
+            "微信支付凭证", "付款成功", "支付成功", "已支付", "成功支付"
+        )
+
+        // Strict completed-transaction action whitelist (checked AFTER stripping brand names like "支付宝" / "微信支付";
+        // bare currency tokens like "元"/"¥"/"RMB" are intentionally excluded).
+        private val TRANSACTION_ACTION_KEYWORDS = listOf(
+            "微信支付凭证", "支付成功", "已支付", "成功支付", "支付了",
+            "付款", "收款", "扣款", "已扣", "支取", "划扣", "代扣", "实付", "已付", "消费",
+            "转账", "转出", "转入", "汇款", "跨行",
+            "支出", "收入", "入账", "到账", "已存入", "存入",
+            "退款", "已退回", "原路退回", "退回原账户", "退货成功",
+            "还款", "提现", "零钱充值", "余额充值",
+            "话费充值", "水费充值", "电费充值", "燃气充值", "油卡充值", "会员充值", "游戏充值",
+            "银证", "第三方存管", "资金存管", "余额宝转", "零钱通转", "基金申购", "基金赎回", "理财申购", "理财赎回",
+            "自动续费", "代发工资", "工资入账", "实发工资", "代发", "分红", "股息",
+            "AA返还", "AA收款", "朋友返还", "分摊返还", "报销", "垫付", "分期购机", "分期消费",
+            "动账", "余额变动", "手续费"
         )
 
         private val ZERO_AUTH_KEYWORDS = listOf(

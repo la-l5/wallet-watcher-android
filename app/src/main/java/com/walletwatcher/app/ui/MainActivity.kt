@@ -652,6 +652,20 @@ class MainActivity : AppCompatActivity() {
                     })
                 }
                 if (tx.status != TxStatus.IGNORED) {
+                    actions.add("标为误记/非交易（移出主账本）" to {
+                        app.appScope.launch {
+                            val ch = app.engine.markAsIgnored(tx.id, expectedRevision = tx.revision)
+                            withContext(Dispatchers.Main) {
+                                if (!isDestroyed && !isFinishing) {
+                                    Toast.makeText(
+                                        this@MainActivity,
+                                        if (ch != null) "已标为误记并移出主账本（可在内部/忽略中撤销）" else "操作失败（记录可能已被修改）",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                }
+                            }
+                        }
+                    })
                     actions.add("标为内部互转（移入内部/忽略）" to {
                         app.appScope.launch { app.engine.markAsInternal(tx.id, expectedRevision = tx.revision) }
                     })
